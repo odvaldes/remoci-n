@@ -220,28 +220,38 @@ if dem_bytes is not None:
 else:
     st.info("No se obtuvo un DEM. Intenta nuevamente la consulta automática o sube un GeoTIFF. No se inventan pendientes.")
 
-st.subheader("Detección territorial: taludes, cauces y candidatos a abanicos")
+st.subheader("Detección territorial: taludes, drenajes y candidatos a abanicos")
+umbral_cauce_ha = st.slider("Área aportante mínima para trazar drenajes (hectáreas)", 1, 100, 15, 1, help="Disminuye el umbral para identificar quebradas menores; aumenta falsos positivos.")
 st.caption("El análisis usa el DEM y cartografía OSM cuando está disponible. Las detecciones geomorfológicas son preliminares; no equivalen a una delimitación oficial de abanicos aluviales.")
 deteccion = None
 if dem_bytes is not None:
-    if st.button("Detectar taludes, cauces y posibles abanicos", type="primary"):
+    if st.button("Detectar drenajes y abanicos desde el relieve", type="primary"):
         try:
             with st.spinner("Analizando relieve y consultando cauces cartografiados..."):
-                deteccion = detectar(polygon, dem_bytes, consultar_osm=True)
+                deteccion = detectar(polygon, dem_bytes, area_min_cauce_ha=umbral_cauce_ha)
                 st.session_state['deteccion_rm'] = deteccion
-                st.session_state['deteccion_rm_geom'] = hashlib.sha256(polygon.wkb + dem_bytes[:1024]).hexdigest()
+                st.session_state['deteccion_rm_geom'] = hashlib.sha256(polygon.wkb + dem_bytes[:1024] + str(umbral_cauce_ha).encode()).hexdigest()
         except Exception as exc:
             st.error(f"No fue posible completar la detección: {exc}")
-    geom_key = hashlib.sha256(polygon.wkb + dem_bytes[:1024]).hexdigest()
+    geom_key = hashlib.sha256(polygon.wkb + dem_bytes[:1024] + str(umbral_cauce_ha).encode()).hexdigest()
     if st.session_state.get('deteccion_rm_geom') == geom_key:
         deteccion = st.session_state.get('deteccion_rm')
     if deteccion:
         a,b,c=st.columns(3)
         a.metric("Distancia a talud potencial", f"{deteccion['distancia_talud_potencial_m']} m" if deteccion['distancia_talud_potencial_m'] is not None else "No detectado")
-        b.metric("Distancia a cauce OSM", f"{deteccion['distancia_cauce_osm_m']} m" if deteccion['distancia_cauce_osm_m'] is not None else "Sin datos")
+        b.metric("Distancia a drenaje modelado", f"{deteccion['distancia_cauce_modelado_m']} m" if deteccion['distancia_cauce_modelado_m'] is not None else "No detectado")
         c.metric("Candidato a abanico", "Sí, revisar" if deteccion['candidato_abanico_detectado'] else "No identificado")
-        st.caption(f"Drenaje topográfico aproximado: {deteccion['distancia_drenaje_topografico_proxy_m']} m. Área con patrón compatible con depósito de pie de ladera: {deteccion['candidato_abanico_porcentaje_poligono']}%.")
-        st.warning("No usar la detección de abanico como clasificación confirmada ni asumir que OSM contiene todos los cauces. Revisar en terreno y con cartografía SERNAGEOMIN.")
+        st.caption(f"Drenajes modelados: {deteccion['cantidad_cauces_modelados']}; posibles salidas de quebrada al piedemonte: {deteccion['cantidad_salidas_piedemonte_candidatas']}. Superficie del polígono marcada como candidata a abanico: {deteccion['candidato_abanico_porcentaje_poligono']}%.")
+        capas = deteccion.get("capas_geojson", {})
+        vista = folium.Map(location=[polygon.centroid.y, polygon.centroid.x], zoom_start=12, tiles="CartoDB positron")
+        for nombre, color in [("cauces_modelados", "#1678cf"), ("taludes", "#b73735"), ("abanicos_candidatos", "#e5a21b"), ("salidas_piedemonte", "#7030a0")]:
+            features = [{"type":"Feature", "properties":{}, "geometry":g} for g in capas.get(nombre, [])]
+            if features:
+                folium.GeoJson({"type":"FeatureCollection", "features":features}, name=nombre, style_function=lambda f, col=color: {"color":col,"weight":2,"fillOpacity":0.25}).add_to(vista)
+        folium.GeoJson(mapping(polygon), name="Polígono del proyecto", style_function=lambda f:{"color":"#111111","weight":3,"fillOpacity":0.02}).add_to(vista)
+        folium.LayerControl().add_to(vista)
+        st_folium(vista, height=470, width=None, key="mapa_resultados_rm")
+        st.warning("Los drenajes son modelados por acumulación D8; los abanicos son candidatos topográficos, no delimitaciones confirmadas. Para verificar abanicos se requiere cartografía geomorfológica y/o evidencia de depósitos.")
         with st.expander("Fuentes y limitaciones de la detección"):
             st.json(deteccion)
 else:

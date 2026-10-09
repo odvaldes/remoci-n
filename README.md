@@ -51,3 +51,13 @@ El módulo se utiliza para evaluación preliminar de inversiones, no para reempl
 Después de seleccionar el polígono y obtener el DEM, pulsar **Detectar taludes, cauces y posibles abanicos**. `deteccion_terreno.py` calcula distancias mínimas del polígono a taludes potenciales (pendiente >=30° y relieve local >=8 m), consulta cauces de OpenStreetMap mediante Overpass, y obtiene una aproximación de drenaje topográfico mediante concavidad del DEM. Detecta *candidatos* a abanicos mediante condiciones heurísticas de pendiente moderada, cercanía a ladera y convergencia; **NO confirma abanicos aluviales ni asigna automáticamente su puntaje de amenaza**. Las distancias y el indicador se incorporan a la ficha JSON.
 
 **Limitaciones:** las distancias se refieren a las geometrías disponibles dentro del DEM y/o a la cobertura OSM; no implican inventario exhaustivo. Los cauces OSM no son necesariamente cauces de flujo aluvional y su ausencia no descarta amenaza. La distancia a cauce **no reemplaza** el subfactor MDSF "distancia a intervenciones del cauce". Para análisis riguroso se requiere DEM con área de aporte aguas arriba, inventario oficial de abanicos/cauces, delimitación geomorfológica y verificación experta. No se han probado las APIs remotas desde este entorno.
+
+## Actualización: drenajes y abanicos derivados del DEM
+
+`deteccion_terreno.py` ya no depende de que OpenStreetMap tenga cartografiadas las quebradas. Usa un algoritmo **priority-flood con acumulación de flujo D8** sobre un DEM métrico, detecta drenajes por área contribuyente mínima configurable (1–100 ha), delimita taludes potenciales y genera **candidatos topográficos** a abanicos cerca de transiciones entre laderas empinadas y piedemonte. Los resultados se dibujan en un segundo mapa de Streamlit.
+
+**Limitaciones esenciales:** la cuenca aportante puede extenderse fuera del recorte DEM (se amplió el contexto por defecto a 2 km); los cauces son simulados y no verificados; la existencia y geometría de abanicos NO pueden confirmarse únicamente con pendiente y acumulación de flujo. Para evaluación normativa deben contrastarse con geomorfología, depósitos, ortofotos y cartografía oficial. En abanicos complejos se recomienda un DEM de mayor resolución y delineación de cuenca aguas arriba. La salida no asigna automáticamente una categoría de amenaza MDSF.
+
+### Prueba local
+
+`python -m pytest -q test_modelo_ird.py test_deteccion.py`

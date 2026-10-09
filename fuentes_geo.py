@@ -52,7 +52,7 @@ def _validate_area(polygon, max_extent_km=18):
         raise ValueError(f'El polígono supera {max_extent_km} km de extensión. Divídelo para limitar las consultas remotas.')
 
 
-def copernicus_dem_bytes(polygon, context_km=0.5):
+def copernicus_dem_bytes(polygon, context_km=2.0):
     """Lee COG remotos y devuelve un GeoTIFF recortado a la extensión + contexto.
 
     No descarga un DEM nacional. Dependiendo de la caché HTTP, GDAL puede
