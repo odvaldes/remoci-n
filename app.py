@@ -1,353 +1,542 @@
-"""GeoRiskAI Sentinel — módulo experimental de remoción en masa por flujos.
+"""GeoRiskAI Sentinel – MVP Streamlit.
 
-Este prototipo aplica escalas de amenaza MDSF 2025 y vulnerabilidad propia
-del modelo tsunami. La agregación final es EXPLORATORIA, no IRD oficial.
+Prototype for collecting property data/photos, requesting a preliminary visual
+assessment, and calculating a transparent quote range from configured tariffs.
+The image-based volume and work-hour estimates are experimental and need field
+validation before being used for real commercial quotes.
 """
+
 from __future__ import annotations
 
-import hashlib
-import io
+import base64
+import csv
 import json
 import os
+import sqlite3
+import uuid
 from datetime import datetime, timezone
+from io import BytesIO
+from pathlib import Path
+from typing import Any
 
-import folium
-import numpy as np
-import pandas as pd
 import streamlit as st
-from folium.plugins import Draw
-from pyproj import CRS, Transformer
-from rasterio.io import MemoryFile
-from rasterio.mask import mask
-from rasterio.warp import calculate_default_transform, reproject, Resampling
-from shapely.geometry import shape, mapping
-from shapely.ops import transform as shapely_transform
-from streamlit_folium import st_folium
-from fuentes_geo import copernicus_dem_bytes, worldcover_resumen
-from deteccion_terreno import detectar
-from modelo_ird import (ESCALAS, TABLA_ESCORRENTIA, MATERIALIDAD, NORMATIVA,
-    puntaje_pendiente, puntaje_escorrentia, coeficiente_escorrentia, calcular_factores,
-    vulnerabilidad_tsunami, indice_exploratorio)
 
-st.set_page_config(page_title="GeoRiskAI | Remoción en masa", page_icon="⛰️", layout="wide")
-st.title("⛰️ GeoRiskAI Sentinel | Remoción en masa por flujos")
-st.caption("Prototipo geoespacial nacional · Evaluación preliminar, no resultado IRD oficial")
-st.warning("Este prototipo aplica las escalas de amenaza MDSF y reutiliza la vulnerabilidad del modelo tsunami. La agregación final no es oficial; las variables geotécnicas y geomorfológicas deben verificarse.")
+try:
+    from PIL import Image
+except ImportError:  # pragma: no cover
+    Image = None
 
-@st.cache_data(show_spinner=False)
-def load_dem_bytes(path: str):
-    with open(path, "rb") as f:
-        return f.read()
+try:
+    from openai import OpenAI
+except ImportError:  # pragma: no cover
+    OpenAI = None
+
+try:
+    from supabase import create_client
+except ImportError:  # pragma: no cover
+    create_client = None
 
 
-def normalize_polygon(geom):
-    g = shape(geom) if isinstance(geom, dict) else geom
-    if g.geom_type not in ("Polygon", "MultiPolygon"):
-        raise ValueError("La geometría debe ser Polygon o MultiPolygon.")
-    if not g.is_valid:
-        g = g.buffer(0)
-    if g.is_empty or not g.is_valid:
-        raise ValueError("El polígono es inválido y no pudo corregirse.")
-    if not (-76 <= g.centroid.x <= -66 and -57 <= g.centroid.y <= -17):
-        st.info("El polígono parece estar fuera del territorio continental chileno. Comprueba que sus coordenadas estén en EPSG:4326.")
-    return g
+APP_DIR = Path(__file__).resolve().parent
+LOCAL_DB = APP_DIR / "georiskai_local.sqlite3"
+PHOTO_BUCKET = "georiskai-photos"
+INSURANCE_PARTNERS_FILE = APP_DIR / "insurance_partners.csv"
 
 
-def uploaded_geojson(file):
-    obj = json.load(file)
-    if obj.get("type") == "FeatureCollection":
-        if len(obj.get("features", [])) != 1:
-            raise ValueError("El GeoJSON debe contener exactamente un polígono por evaluación.")
-        geom = obj["features"][0]["geometry"]
-    elif obj.get("type") == "Feature":
-        geom = obj["geometry"]
-    else:
-        geom = obj
-    return normalize_polygon(geom)
+def get_setting(name: str, default: str = "") -> str:
+    value = os.getenv(name)
+    if value:
+        return value
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:
+        return default
 
 
-def geometry_area_ha(g):
-    # UTM local, adecuado para estimar superficie del polígono
-    lon, lat = g.centroid.x, g.centroid.y
-    zone = int((lon + 180) // 6) + 1
-    epsg = 32700 + zone if lat < 0 else 32600 + zone
-    tx = Transformer.from_crs("EPSG:4326", f"EPSG:{epsg}", always_xy=True)
-    gp = shapely_transform(tx.transform, g)
-    return gp.area / 10000
+def numeric_or_none(value: Any) -> float | None:
+    if value is None or value == "":
+        return None
+    try:
+        number = float(value)
+        return number if number >= 0 else None
+    except (TypeError, ValueError):
+        return None
 
 
-def analyze_dem(dem_bytes, polygon):
-    """Recorta DEM y calcula pendientes en grados, sobre grilla métrica reproyectada.
+def prepare_photo(uploaded_file: Any) -> tuple[bytes, str]:
+    """Resize and normalize a photo so it can be sent to a vision model."""
+    raw = uploaded_file.getvalue()
+    if Image is None:
+        return raw, uploaded_file.type or "image/jpeg"
+    image = Image.open(BytesIO(raw)).convert("RGB")
+    image.thumbnail((1800, 1800))
+    output = BytesIO()
+    image.save(output, format="JPEG", quality=82, optimize=True)
+    return output.getvalue(), "image/jpeg"
 
-    El máximo de pendiente depende de resolución, calidad y ruido del DEM.
-    Se reportan también mediana y p95 para control de calidad.
-    """
-    with MemoryFile(dem_bytes) as mem:
-        with mem.open() as src:
-            if src.crs is None:
-                raise ValueError("El DEM debe tener un sistema de referencia definido.")
-            trans = Transformer.from_crs("EPSG:4326", src.crs, always_xy=True)
-            projected_polygon = shapely_transform(trans.transform, polygon)
-            cropped, cropped_transform = mask(src, [mapping(projected_polygon)], crop=True, filled=False)
-            arr = cropped[0].astype("float32").filled(np.nan)
-            if np.count_nonzero(np.isfinite(arr)) < 9:
-                raise ValueError("El DEM no contiene suficientes píxeles válidos dentro del polígono.")
-            lon, lat = polygon.centroid.x, polygon.centroid.y
-            zone = int((lon + 180) // 6) + 1
-            target_crs = CRS.from_epsg((32700 if lat < 0 else 32600) + zone)
-            # La reproyección se realiza sobre el recorte, nunca sobre un raster nacional completo.
-            from rasterio.transform import array_bounds
-            h, w = arr.shape
-            bounds = array_bounds(h, w, cropped_transform)
-            dst_transform, dw, dh = calculate_default_transform(src.crs, target_crs, w, h, *bounds)
-            if dw * dh > 10_000_000:
-                raise ValueError("El área es demasiado grande para esta evaluación interactiva. Divide el polígono.")
-            dst = np.full((dh, dw), np.nan, dtype="float32")
-            reproject(source=arr, destination=dst, src_transform=cropped_transform,
-                      src_crs=src.crs, dst_transform=dst_transform, dst_crs=target_crs,
-                      src_nodata=np.nan, dst_nodata=np.nan, resampling=Resampling.bilinear)
-            dy, dx = abs(dst_transform.e), abs(dst_transform.a)
-            if min(dst.shape) < 3 or dx <= 0 or dy <= 0:
-                raise ValueError("Recorte demasiado pequeño para calcular pendiente.")
-            gy, gx = np.gradient(dst, dy, dx)
-            slope = np.degrees(np.arctan(np.hypot(gx, gy)))
-            # Excluir bordes del raster recortado para evitar pendientes espurias por nodata.
-            slope[0, :] = np.nan; slope[-1, :] = np.nan
-            slope[:, 0] = np.nan; slope[:, -1] = np.nan
-            finite = slope[np.isfinite(slope)]
-            elev = dst[np.isfinite(dst)]
-            if finite.size == 0:
-                raise ValueError("No se obtuvieron pendientes válidas.")
-            return {
-                "pendiente_max_grados": round(float(np.max(finite)), 2),
-                "pendiente_p95_grados": round(float(np.percentile(finite, 95)), 2),
-                "pendiente_mediana_grados": round(float(np.median(finite)), 2),
-                "elevacion_min_m": round(float(np.min(elev)), 1),
-                "elevacion_max_m": round(float(np.max(elev)), 1),
-                "resolucion_m_aprox": round(float(max(dx, dy)), 1),
-                "pixeles_pendiente_validos": int(finite.size),
+
+def analyze_photos(
+    photos: list[tuple[bytes, str]], built_m2: float, unbuilt_m2: float
+) -> dict[str, Any]:
+    api_key = get_setting("OPENAI_API_KEY")
+    model = get_setting("OPENAI_VISION_MODEL", "gpt-4.1-mini")
+    if not api_key or OpenAI is None:
+        raise RuntimeError(
+            "Falta OPENAI_API_KEY. Configúrala en Streamlit Secrets para activar "
+            "el análisis de fotos. Sin esa clave, la app no inventa resultados."
+        )
+
+    prompt = f"""Analiza las fotografías de una propiedad afectada por un evento.
+Superficie construida informada: {built_m2} m².
+Superficie no construida informada: {unbuilt_m2} m².
+
+Devuelve exclusivamente un objeto JSON válido con estas claves:
+cleaning_level: una de "leve", "moderado", "alto", "crítico" o "indeterminado";
+damage_level: una de "leve", "moderado", "alto", "crítico" o "indeterminado";
+damage_notes: descripción breve de daños visibles, sin diagnosticar estructura;
+debris_volume_m3_min y debris_volume_m3_max: números o null;
+person_hours_min y person_hours_max: números o null;
+affected_built_area_m2 y affected_unbuilt_area_m2: números o null;
+recommended_services: lista usando solo "retiro", "limpieza", "reparaciones", "vidrios";
+confidence: "baja", "media" o "alta";
+visual_notes: texto breve en español.
+
+Entrega rangos preliminares, no una tasación ni una cotización definitiva. No
+supongas lo que queda fuera de las fotos. Usa las superficies informadas como
+referencia de escala, pero no las trates como área afectada. Si la perspectiva,
+ocultamiento o falta de escala impiden estimar volumen u horas, devuelve null.
+No infieras daños estructurales ni riesgos de salud no claramente visibles."""
+
+    content: list[dict[str, Any]] = [{"type": "text", "text": prompt}]
+    for image_bytes, mime in photos:
+        encoded = base64.b64encode(image_bytes).decode("ascii")
+        content.append(
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{mime};base64,{encoded}",
+                    "detail": "high",
+                },
             }
+        )
+
+    client = OpenAI(api_key=api_key)
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {
+                "role": "system",
+                "content": "Eres un estimador visual preliminar. Responde solo JSON.",
+            },
+            {"role": "user", "content": content},
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.1,
+    )
+    raw = response.choices[0].message.content or "{}"
+    result = json.loads(raw)
+
+    for field in (
+        "debris_volume_m3_min",
+        "debris_volume_m3_max",
+        "person_hours_min",
+        "person_hours_max",
+        "affected_built_area_m2",
+        "affected_unbuilt_area_m2",
+    ):
+        result[field] = numeric_or_none(result.get(field))
+    result.setdefault("cleaning_level", "indeterminado")
+    result.setdefault("damage_level", "indeterminado")
+    result.setdefault("damage_notes", "")
+    result.setdefault("recommended_services", [])
+    result.setdefault("confidence", "baja")
+    result.setdefault("visual_notes", "")
+    return result
+
+
+def quote_range(
+    assessment: dict[str, Any],
+    hourly_rate: float,
+    removal_rate_m3: float,
+    transport_fixed: float,
+    equipment_fixed: float,
+    crew_size: int,
+    hours_per_shift: float,
+) -> tuple[float, float] | None:
+    h_min = assessment.get("person_hours_min")
+    h_max = assessment.get("person_hours_max")
+    v_min = assessment.get("debris_volume_m3_min")
+    v_max = assessment.get("debris_volume_m3_max")
+    if h_min is None or h_max is None or v_min is None or v_max is None:
+        return None
+    if hourly_rate <= 0 and removal_rate_m3 <= 0:
+        return None
+    low = h_min * hourly_rate + v_min * removal_rate_m3
+    high = h_max * hourly_rate + v_max * removal_rate_m3
+    low += transport_fixed + equipment_fixed
+    high += transport_fixed + equipment_fixed
+    return low, high
+
+
+def save_locally(record: dict[str, Any]) -> None:
+    """Local fallback for development. Streamlit Cloud disk is not durable."""
+    with sqlite3.connect(LOCAL_DB) as connection:
+        connection.execute(
+            "CREATE TABLE IF NOT EXISTS requests "
+            "(id TEXT PRIMARY KEY, created_at TEXT, payload TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO requests (id, created_at, payload) VALUES (?, ?, ?)",
+            (record["id"], record["created_at"], json.dumps(record, ensure_ascii=False)),
+        )
+        connection.commit()
+
+
+def save_supabase(record: dict[str, Any], photos: list[tuple[bytes, str]]) -> None:
+    url = get_setting("SUPABASE_URL")
+    key = get_setting("SUPABASE_ANON_KEY")
+    if not url or not key or create_client is None:
+        raise RuntimeError("Supabase no está configurado.")
+
+    client = create_client(url, key)
+    if record.get("consent_training_photos") and photos:
+        stored_paths = []
+        for index, (photo_bytes, mime) in enumerate(photos, start=1):
+            path = f"{record['id']}/{index}.jpg"
+            client.storage.from_(PHOTO_BUCKET).upload(
+                path,
+                photo_bytes,
+                {"content-type": mime, "upsert": "false"},
+            )
+            stored_paths.append(path)
+        record["photo_paths"] = stored_paths
+    client.table("georiskai_requests").insert(record).execute()
+
+
+def load_insurance_partners() -> list[dict[str, str]]:
+    """Load only partners and products manually verified by the app operator."""
+    if not INSURANCE_PARTNERS_FILE.exists():
+        return []
+    with INSURANCE_PARTNERS_FILE.open(encoding="utf-8-sig", newline="") as file:
+        return list(csv.DictReader(file))
+
+
+def match_insurance_partners(
+    comuna: str, risks: list[str], claim_support: bool
+) -> list[dict[str, str]]:
+    matches = []
+    for partner in load_insurance_partners():
+        truthy = lambda key: partner.get(key, "").strip().lower() in {"1", "true", "si", "sí", "yes"}
+        if not truthy("active") or not truthy("verified"):
+            continue
+        if not partner.get("verified_on") or not partner.get("cmf_registration"):
+            continue
+        if claim_support and not truthy("claim_support"):
+            continue
+        if not claim_support and not truthy("future_cover"):
+            continue
+        areas = [x.strip().casefold() for x in partner.get("communes", "").split("|") if x.strip()]
+        if "*" not in areas and comuna.strip().casefold() not in areas:
+            continue
+        covered_risks = [x.strip().casefold() for x in partner.get("risks", "").split("|") if x.strip()]
+        if not claim_support and not any(risk.casefold() in covered_risks for risk in risks):
+            continue
+        if not partner.get("contact_url") and not partner.get("contact_email"):
+            continue
+        matches.append(partner)
+    return matches
+
+
+def save_insurance_request(record: dict[str, Any]) -> None:
+    url = get_setting("SUPABASE_URL")
+    key = get_setting("SUPABASE_ANON_KEY")
+    if url and key and create_client is not None:
+        client = create_client(url, key)
+        client.table("georiskai_insurance_requests").insert(record).execute()
+    else:
+        save_locally(record)
+
+
+st.set_page_config(page_title="GeoRiskAI Sentinel", page_icon="🌊", layout="centered")
+st.title("GeoRiskAI Sentinel")
+st.caption("Evaluación preliminar y solicitud de servicios para inmuebles afectados")
+st.info(
+    "Prototipo de validación. El análisis fotográfico y los presupuestos son "
+    "referenciales; requieren contraste con empresas y mediciones reales."
+)
 
 with st.sidebar:
-    st.header("Área de estudio")
-    st.markdown("Dibuja **un polígono** en el mapa o sube un archivo GeoJSON en coordenadas WGS84 (EPSG:4326).")
-    upload = st.file_uploader("Cargar polígono GeoJSON", type=["geojson", "json"])
-    st.header("Datos de elevación")
-    st.caption("Opción A: cargar un DEM GeoTIFF que cubra el polígono. Opción B: configurar DEM_PATH en Streamlit Secrets o variable de entorno con ruta a un GeoTIFF accesible en el servidor.")
-    dem_upload = st.file_uploader("DEM GeoTIFF (opcional)", type=["tif", "tiff"])
-    st.header("Fuentes geoespaciales automáticas")
-    usar_copernicus = st.checkbox("Consultar Copernicus DEM GLO-30 automáticamente", value=True)
-    usar_worldcover = st.checkbox("Consultar ESA WorldCover automáticamente", value=True)
-    st.caption("Se requiere conexión del servidor a Internet. Consultas remotas limitadas a polígonos pequeños; no se descarga Chile completo.")
+    st.header("Parámetros de presupuesto")
+    st.caption("Ingresa tarifas reales de referencia. En cero, el total no se calcula.")
+    rate_hour = st.number_input("Tarifa por hora-hombre (CLP)", min_value=0, step=1000)
+    rate_m3 = st.number_input("Retiro/disposición por m³ (CLP)", min_value=0, step=5000)
+    transport = st.number_input("Transporte fijo (CLP)", min_value=0, step=5000)
+    equipment = st.number_input("Equipos/materiales (CLP)", min_value=0, step=5000)
+    crew = st.number_input("Personas por cuadrilla", min_value=1, max_value=20, value=2)
+    shift_hours = st.number_input("Horas por jornada-equipo", min_value=1.0, max_value=16.0, value=8.0)
+    st.caption("La jornada-equipo es una unidad comercial configurable.")
 
-m = folium.Map(location=[-33.45, -70.65], zoom_start=5, tiles="CartoDB positron", control_scale=True)
-folium.TileLayer("OpenStreetMap", name="OpenStreetMap").add_to(m)
-Draw(export=False, draw_options={"polyline": False, "rectangle": True, "circle": False,
-    "circlemarker": False, "marker": False}, edit_options={"edit": True, "remove": True}).add_to(m)
-folium.LayerControl().add_to(m)
-map_data = st_folium(m, width=None, height=540, returned_objects=["all_drawings", "last_active_drawing"], key="mapa_remocion")
+st.subheader("1. Datos del inmueble")
+with st.form("assessment_form", clear_on_submit=False):
+    c1, c2 = st.columns(2)
+    with c1:
+        address = st.text_input("Dirección o ubicación", placeholder="Calle, número, comuna")
+        comuna = st.text_input("Comuna", placeholder="Ej.: Coquimbo")
+        built_m2 = st.number_input("Superficie construida (m²)", min_value=0.0, step=1.0)
+    with c2:
+        event_type = st.selectbox(
+            "Evento", ["Tsunami/maremoto", "Remoción en masa", "Inundación", "Incendio", "Otro"]
+        )
+        unbuilt_m2 = st.number_input("Superficie no construida (m²)", min_value=0.0, step=1.0)
+        contact_name = st.text_input("Nombre", placeholder="Opcional")
 
-polygon = None
-try:
-    if upload is not None:
-        polygon = uploaded_geojson(upload)
-    elif map_data and map_data.get("all_drawings"):
-        drawings = map_data["all_drawings"]
-        if len(drawings) > 1:
-            st.info("Hay varios polígonos dibujados; se analizará el último. Para otra evaluación elimina los anteriores.")
-        polygon = normalize_polygon(drawings[-1]["geometry"])
-except Exception as exc:
-    st.error(f"Error de geometría: {exc}")
+    email = st.text_input("Correo para recibir respuesta", placeholder="Opcional")
+    phone = st.text_input("Teléfono", placeholder="Opcional")
+    photos_upload = st.file_uploader(
+        "Fotos del inmueble y de las zonas afectadas (hasta 5)",
+        type=["jpg", "jpeg", "png", "webp"],
+        accept_multiple_files=True,
+    )
+    selected_services = st.multiselect(
+        "Servicios que podrían interesarte",
+        ["Retiro de escombros", "Limpieza", "Reparaciones", "Cambio de vidrios"],
+    )
 
-if polygon is None:
-    st.info("Selecciona el polígono para activar el análisis.")
-    st.stop()
+    st.markdown("**Permisos y uso de datos**")
+    consent_ai = st.checkbox(
+        "Autorizo enviar las fotos a un servicio de IA para generar una estimación preliminar.",
+        value=False,
+    )
+    consent_provider = st.checkbox(
+        "Autorizo compartir mis datos de contacto y ubicación con empresas para solicitar cotizaciones.",
+        value=False,
+    )
+    consent_training = st.checkbox(
+        "Autorizo conservar mis fotos y datos anonimizados para mejorar el modelo.",
+        value=False,
+    )
+    submitted = st.form_submit_button("Analizar y generar presupuesto", type="primary")
 
-area = geometry_area_ha(polygon)
-st.subheader("Caracterización del polígono")
-c1, c2, c3 = st.columns(3)
-c1.metric("Superficie", f"{area:,.2f} ha")
-c2.metric("Longitud centroide", f"{polygon.centroid.x:.5f}°")
-c3.metric("Latitud centroide", f"{polygon.centroid.y:.5f}°")
+if submitted:
+    if not address or not comuna:
+        st.error("Ingresa una dirección y comuna para registrar la solicitud.")
+        st.stop()
+    if len(photos_upload or []) > 5:
+        st.error("Puedes cargar hasta cinco fotos.")
+        st.stop()
+    if not photos_upload:
+        st.error("Carga al menos una foto para solicitar el análisis visual.")
+        st.stop()
+    if not consent_ai:
+        st.error("Para analizar las imágenes debes autorizar su envío al servicio de IA.")
+        st.stop()
 
-result = {"superficie_ha": round(area, 4), "fuente": "polígono suministrado por el usuario"}
-dem_bytes = None
-if dem_upload is not None:
-    dem_bytes = dem_upload.getvalue()
-else:
-    dem_path = os.environ.get("DEM_PATH", "")
-    try:
-        dem_path = st.secrets.get("DEM_PATH", dem_path)
-    except Exception:
-        pass
-    if dem_path and os.path.isfile(dem_path):
-        dem_bytes = load_dem_bytes(dem_path)
-
-fuentes_automaticas = {}
-if dem_bytes is None and usar_copernicus:
-    try:
-        with st.spinner("Consultando Copernicus DEM GLO-30 en la nube..."):
-            dem_bytes, metadata_dem = copernicus_dem_bytes(polygon)
-            fuentes_automaticas["dem"] = metadata_dem
-        st.success("DEM obtenido automáticamente desde Copernicus.")
-    except Exception as exc:
-        st.warning(f"Consulta automática DEM no disponible: {exc}. Puedes cargar un GeoTIFF manualmente.")
-
-if usar_worldcover:
-    try:
-        with st.spinner("Consultando ESA WorldCover..."):
-            resumen_cobertura = worldcover_resumen(polygon)
-            fuentes_automaticas["worldcover"] = resumen_cobertura
-        st.subheader("Cobertura de suelo — ESA WorldCover")
-        st.dataframe(pd.DataFrame(resumen_cobertura["clases"]), use_container_width=True, hide_index=True)
-        st.caption("La cobertura se presenta como antecedente; no se asigna automáticamente la permeabilidad ni el coeficiente de escorrentía MDSF.")
-    except Exception as exc:
-        st.warning(f"WorldCover no disponible para esta consulta: {exc}. Continúa con clasificación manual.")
-
-if dem_bytes is not None:
-    try:
-        with st.spinner("Procesando relieve y pendientes..."):
-            result.update(analyze_dem(dem_bytes, polygon))
-        st.success("Pendientes calculadas sobre el DEM proporcionado.")
-        cols = st.columns(4)
-        cols[0].metric("Pendiente máxima", f"{result['pendiente_max_grados']}°")
-        cols[1].metric("Pendiente p95", f"{result['pendiente_p95_grados']}°")
-        cols[2].metric("Elevación mínima", f"{result['elevacion_min_m']} m")
-        cols[3].metric("Elevación máxima", f"{result['elevacion_max_m']} m")
-        st.caption("Pendiente máxima derivada del DEM: resultado preliminar sensible a resolución, errores y delimitación. Verificar la celda de análisis exigida por el manual MDSF.")
-    except Exception as exc:
-        st.error(f"No se pudo procesar el DEM: {exc}")
-else:
-    st.info("No se obtuvo un DEM. Intenta nuevamente la consulta automática o sube un GeoTIFF. No se inventan pendientes.")
-
-st.subheader("Detección territorial: taludes, drenajes y candidatos a abanicos")
-umbral_cauce_ha = st.slider("Área aportante mínima para trazar drenajes (hectáreas)", 1, 100, 15, 1, help="Disminuye el umbral para identificar quebradas menores; aumenta falsos positivos.")
-st.caption("El análisis usa el DEM y cartografía OSM cuando está disponible. Las detecciones geomorfológicas son preliminares; no equivalen a una delimitación oficial de abanicos aluviales.")
-deteccion = None
-if dem_bytes is not None:
-    if st.button("Detectar drenajes y abanicos desde el relieve", type="primary"):
+    normalized_photos = [prepare_photo(photo) for photo in photos_upload]
+    with st.spinner("Analizando las imágenes. La estimación puede variar según el ángulo y la visibilidad..."):
         try:
-            with st.spinner("Analizando relieve y consultando cauces cartografiados..."):
-                deteccion = detectar(polygon, dem_bytes, area_min_cauce_ha=umbral_cauce_ha)
-                st.session_state['deteccion_rm'] = deteccion
-                st.session_state['deteccion_rm_geom'] = hashlib.sha256(polygon.wkb + dem_bytes[:1024] + str(umbral_cauce_ha).encode()).hexdigest()
+            assessment = analyze_photos(normalized_photos, built_m2, unbuilt_m2)
+            status = "estimacion_visual_generada"
         except Exception as exc:
-            st.error(f"No fue posible completar la detección: {exc}")
-    geom_key = hashlib.sha256(polygon.wkb + dem_bytes[:1024] + str(umbral_cauce_ha).encode()).hexdigest()
-    if st.session_state.get('deteccion_rm_geom') == geom_key:
-        deteccion = st.session_state.get('deteccion_rm')
-    if deteccion:
-        a,b,c=st.columns(3)
-        a.metric("Distancia a talud potencial", f"{deteccion['distancia_talud_potencial_m']} m" if deteccion['distancia_talud_potencial_m'] is not None else "No detectado")
-        b.metric("Distancia a drenaje modelado", f"{deteccion['distancia_cauce_modelado_m']} m" if deteccion['distancia_cauce_modelado_m'] is not None else "No detectado")
-        c.metric("Candidato a abanico", "Sí, revisar" if deteccion['candidato_abanico_detectado'] else "No identificado")
-        st.caption(f"Drenajes modelados: {deteccion['cantidad_cauces_modelados']}; posibles salidas de quebrada al piedemonte: {deteccion['cantidad_salidas_piedemonte_candidatas']}. Superficie del polígono marcada como candidata a abanico: {deteccion['candidato_abanico_porcentaje_poligono']}%.")
-        capas = deteccion.get("capas_geojson", {})
-        vista = folium.Map(location=[polygon.centroid.y, polygon.centroid.x], zoom_start=12, tiles="CartoDB positron")
-        for nombre, color in [("cauces_modelados", "#1678cf"), ("taludes", "#b73735"), ("abanicos_candidatos", "#e5a21b"), ("salidas_piedemonte", "#7030a0")]:
-            features = [{"type":"Feature", "properties":{}, "geometry":g} for g in capas.get(nombre, [])]
-            if features:
-                folium.GeoJson({"type":"FeatureCollection", "features":features}, name=nombre, style_function=lambda f, col=color: {"color":col,"weight":2,"fillOpacity":0.25}).add_to(vista)
-        folium.GeoJson(mapping(polygon), name="Polígono del proyecto", style_function=lambda f:{"color":"#111111","weight":3,"fillOpacity":0.02}).add_to(vista)
-        folium.LayerControl().add_to(vista)
-        st_folium(vista, height=470, width=None, key="mapa_resultados_rm")
-        st.warning("Los drenajes son modelados por acumulación D8; los abanicos son candidatos topográficos, no delimitaciones confirmadas. Para verificar abanicos se requiere cartografía geomorfológica y/o evidencia de depósitos.")
-        with st.expander("Fuentes y limitaciones de la detección"):
-            st.json(deteccion)
-else:
-    st.info("Se necesita un DEM para detectar taludes y patrones de terreno. Activa Copernicus o carga un GeoTIFF.")
+            assessment = None
+            status = "pendiente_analisis"
+            st.error(f"No se pudo completar el análisis: {exc}")
 
-st.subheader("Evaluación de amenaza por flujos — escalas MDSF 2025")
-st.caption("Se aplican los pesos INTERNOS de condicionantes de generación y área de alcance del manual. La combinación de ambos factores no está definida en este manual de escalas.")
-with st.expander("Cómo se determina la escorrentía (tabla 1, página 10)", expanded=True):
-    ca, cb = st.columns(2)
-    cobertura = ca.selectbox("Cobertura de suelo", list(TABLA_ESCORRENTIA))
-    tipo_suelo = cb.selectbox("Permeabilidad del suelo", list(TABLA_ESCORRENTIA[cobertura]))
-    slope_pct = None
-    if "pendiente_max_grados" in result:
-        slope_pct = float(np.tan(np.radians(result["pendiente_max_grados"])) * 100)
-        st.caption(f"Pendiente máxima del DEM: {result['pendiente_max_grados']}° ({slope_pct:.1f}%). Revisar representatividad de la celda de análisis.")
-    slope_manual = st.number_input("Pendiente (%) para tabla de escorrentía", min_value=0.0,
-                                   value=round(slope_pct, 2) if slope_pct is not None else 0.0, step=0.5)
-    if slope_pct is None:
-        st.info("Sin DEM: ingresa la pendiente medida. No se presupone que el polígono tenga pendiente 0%.")
-    coef = coeficiente_escorrentia(cobertura, tipo_suelo, slope_manual)
-    st.metric("Coeficiente según tabla MDSF", f"{coef:.2f}")
+    record_id = str(uuid.uuid4())
+    now = datetime.now(timezone.utc).isoformat()
+    budget = (
+        quote_range(assessment, rate_hour, rate_m3, transport, equipment, int(crew), shift_hours)
+        if assessment
+        else None
+    )
+    record: dict[str, Any] = {
+        "id": record_id,
+        "created_at": now,
+        "address": address,
+        "comuna": comuna,
+        "event_type": event_type,
+        "built_m2": built_m2,
+        "unbuilt_m2": unbuilt_m2,
+        "contact_name": contact_name or None,
+        "email": email or None,
+        "phone": phone or None,
+        "requested_services": selected_services,
+        "consent_ai": consent_ai,
+        "consent_provider_sharing": consent_provider,
+        "consent_training_photos": consent_training,
+        "analysis_status": status,
+        "assessment": assessment,
+        "budget_min_clp": budget[0] if budget else None,
+        "budget_max_clp": budget[1] if budget else None,
+        "provider_match_status": "pendiente_revision_manual",
+    }
 
-usar_pendiente_dem = "pendiente_max_grados" in result
-pendiente_sel = None
-if usar_pendiente_dem:
-    auto_pend = puntaje_pendiente(result["pendiente_max_grados"])
-    st.write(f"Pendiente desde DEM: **{result['pendiente_max_grados']}°**; valoración automática: **{auto_pend if auto_pend is not None else 'no definida para ≤1°'}**")
-    usar_auto = st.checkbox("Usar pendiente del DEM como valoración preliminar", value=auto_pend is not None, disabled=auto_pend is None)
-    if usar_auto:
-        pendiente_sel = auto_pend
+    try:
+        if get_setting("SUPABASE_URL") and get_setting("SUPABASE_ANON_KEY"):
+            save_supabase(record, normalized_photos)
+            storage_note = "Solicitud guardada en Supabase."
+        else:
+            save_locally(record)
+            storage_note = "Solicitud guardada localmente."
+        st.session_state["last_record"] = record
+        st.success(storage_note)
+    except Exception as exc:
+        st.session_state["last_record"] = record
+        st.warning(f"Resultado generado, pero no se pudo guardar: {exc}")
 
-selecciones = {}
-for factor in ESCALAS:
-    if factor == "pendiente" and pendiente_sel is not None:
-        selecciones[factor] = pendiente_sel
-        continue
-    if factor == "escorrentia":
-        usar_tabla = st.checkbox("Usar coeficiente de escorrentía de la tabla MDSF", value=True)
-        if usar_tabla:
-            selecciones[factor] = puntaje_escorrentia(coef)
-            continue
-    etiqueta = {"pendiente": "Pendiente de ladera", "escorrentia": "Coeficiente de escorrentía",
-                "fundacion": "Suelo de fundación (antecedente geotécnico)",
-                "localizacion": "Localización respecto a cauce / abanico aluvial",
-                "taludes": "Distancia a taludes", "intervencion": "Distancia a intervención del cauce"}[factor]
-    opciones = ["Sin información"] + list(ESCALAS[factor])
-    seleccionado = st.selectbox(etiqueta, opciones, key=f"rm_{factor}")
-    selecciones[factor] = ESCALAS[factor].get(seleccionado) if seleccionado != "Sin información" else None
+    if assessment:
+        st.divider()
+        st.subheader("2. Resultado preliminar")
+        st.write(f"**Nivel de limpieza:** {assessment.get('cleaning_level', 'indeterminado').capitalize()}")
+        st.write(f"**Nivel de daño físico visible:** {assessment.get('damage_level', 'indeterminado').capitalize()}")
+        st.write(f"**Confianza visual:** {assessment.get('confidence', 'baja').capitalize()}")
+        vmin, vmax = assessment.get("debris_volume_m3_min"), assessment.get("debris_volume_m3_max")
+        hmin, hmax = assessment.get("person_hours_min"), assessment.get("person_hours_max")
+        if vmin is not None and vmax is not None:
+            st.metric("Volumen estimado de escombros", f"{vmin:g}–{vmax:g} m³")
+        else:
+            st.warning("Las fotos no permiten estimar un volumen con confianza suficiente.")
+        if hmin is not None and hmax is not None:
+            jmin = hmin / (int(crew) * shift_hours)
+            jmax = hmax / (int(crew) * shift_hours)
+            st.write(f"**Trabajo estimado:** {hmin:g}–{hmax:g} horas-hombre")
+            st.write(f"**Jornadas-equipo estimadas:** {jmin:.1f}–{jmax:.1f} (cuadrilla de {int(crew)})")
+        if budget:
+            st.metric("Presupuesto referencial", f"${budget[0]:,.0f}–${budget[1]:,.0f} CLP")
+        else:
+            st.info("Ingresa tarifas de referencia en el panel lateral para calcular un rango de presupuesto.")
+        st.write(assessment.get("visual_notes", ""))
+        if assessment.get("damage_notes"):
+            st.write("**Daños visibles:** " + assessment["damage_notes"])
+        services = assessment.get("recommended_services", [])
+        if services:
+            st.write("**Servicios sugeridos por las fotos:** " + ", ".join(services))
+        st.caption(
+            "Estimación automática experimental; no constituye tasación, diagnóstico estructural "
+            "ni precio definitivo. Una empresa debe confirmar alcance y precio."
+        )
+        if consent_provider:
+            st.info("La solicitud queda disponible para revisión y asignación manual a empresas verificadas.")
+        else:
+            st.info("No compartiremos tus datos con empresas; puedes solicitar cotizaciones más adelante.")
 
-factores = calcular_factores(selecciones)
-if factores["completo"]:
-    cgen, calc = st.columns(2)
-    cgen.metric("Condicionantes de generación", f"{factores['condicionantes_generacion']:.1%}")
-    calc.metric("Área de alcance", f"{factores['area_alcance']:.1%}")
-else:
-    st.info("Amenaza incompleta. Faltan: " + ", ".join(factores["faltantes"]))
+st.divider()
+st.caption(
+    "Para guardar solicitudes de manera persistente en Streamlit Cloud, configura Supabase. "
+    "Sin Supabase, el prototipo usa una base local temporal."
+)
 
-st.subheader("Vulnerabilidad — valoración propia del modelo tsunami")
-st.caption("Se reutiliza la vulnerabilidad de GeoRiskAI Sentinel: materialidad (75%) y antigüedad normativa (25%). NO es la vulnerabilidad oficial del manual de remoción en masa.")
-v1, v2 = st.columns(2)
-material = v1.selectbox("Vulnerabilidad por materialidad", list(MATERIALIDAD))
-norma = v2.selectbox("Antigüedad normativa", list(NORMATIVA))
-vuln = vulnerabilidad_tsunami(material, norma)
-st.metric("Vulnerabilidad del proyecto", f"{vuln:.1%}")
+st.divider()
+st.header("3. Match de seguros")
+st.write(
+    "Usa el resultado territorial de GeoRiskAI para encontrar orientación con un "
+    "corredor, aseguradora o liquidador que tenga cobertura o atención pertinente."
+)
+insurance_intent = st.radio(
+    "¿Qué necesitas?",
+    [
+        "Ya ocurrió un evento: orientación sobre un seguro vigente",
+        "Quiero buscar cobertura para eventos futuros",
+    ],
+    horizontal=False,
+    key="insurance_intent",
+)
+previous_property = st.session_state.get("last_record", {})
+previous_event = previous_property.get("event_type", "")
+hazard_options = ["Tsunami/maremoto", "Remoción en masa", "Inundación", "Incendio", "Sismo"]
+hazard_default = [previous_event] if previous_event in hazard_options else []
 
-st.subheader("Integración de amenaza y vulnerabilidad — ponderaciones del proyecto")
-st.warning("El manual de escalas proporcionado no contiene la fórmula que combina condicionantes y alcance, ni una fórmula para combinar esta amenaza con tu vulnerabilidad tsunami. La ponderación 66,7% amenaza y 33,3% vulnerabilidad corresponde a GeoRiskAI Sentinel, no al manual MDSF. La agregación interna entre condicionantes y alcance continúa siendo una hipótesis configurable.")
-p_gen = st.slider("Peso de condicionantes de generación dentro de amenaza (%) — provisional", 0, 100, 50, 5) / 100
-p_amenaza = 0.667
-st.info("Ponderación fija del modelo: Amenaza 66,7% · Vulnerabilidad 33,3%")
-st.caption(f"Área de alcance: {1-p_gen:.0%} de la amenaza. Vulnerabilidad: {1-p_amenaza:.0%} del índice combinado.")
-resultado_indice = None
-if factores["completo"]:
-    resultado_indice = indice_exploratorio(factores["condicionantes_generacion"],
-        factores["area_alcance"], vuln, p_gen, p_amenaza)
-    c_a, c_b = st.columns(2)
-    c_a.metric("Amenaza combinada (exploratoria)", f"{resultado_indice['amenaza_exploratoria']:.1%}")
-    c_b.metric("Índice combinado (NO oficial)", f"{resultado_indice['indice_exploratorio']:.1%}")
-else:
-    st.error("Índice combinado: no calculado. Completa los seis subfactores de amenaza.")
+with st.form("insurance_form", clear_on_submit=False):
+    comuna_ins = st.text_input(
+        "Comuna del inmueble", value=previous_property.get("comuna", ""), key="insurance_comuna"
+    )
+    risks_ins = st.multiselect(
+        "Amenazas de interés",
+        hazard_options,
+        default=hazard_default,
+        key="insurance_risks",
+    )
+    if insurance_intent.startswith("Ya ocurrió"):
+        active_policy = st.selectbox(
+            "¿Tienes una póliza vigente para este inmueble?",
+            ["Sí", "No", "No estoy segura"],
+            key="active_policy",
+        )
+    else:
+        active_policy = "No aplica"
+    insurance_name = st.text_input("Nombre", key="insurance_name")
+    insurance_email = st.text_input("Correo", key="insurance_email")
+    insurance_phone = st.text_input("Teléfono", key="insurance_phone")
+    consent_insurance_contact = st.checkbox(
+        "Autorizo guardar mis datos de contacto para gestionar esta solicitud de orientación.",
+        key="consent_insurance_contact",
+    )
+    insurance_submitted = st.form_submit_button("Buscar coincidencias de seguro", type="primary")
 
-report = {
-    "aplicacion": "GeoRiskAI Sentinel - Remoción en masa por flujos",
-    "fecha_utc": datetime.now(timezone.utc).isoformat(),
-    "estado_ird": "NO OFICIAL — escenario exploratorio" if resultado_indice else "NO CALCULADO",
-    "advertencia": "Escalas de amenaza MDSF 2025; vulnerabilidad del modelo tsunami; integración de pesos no validada como MDSF.",
-    "geometria_epsg4326": mapping(polygon), "caracterizacion_terreno": result,
-    "fuentes_automaticas": fuentes_automaticas,
-    "deteccion_terreno": deteccion,
-    "escalas_amenaza": selecciones, "factores_amenaza": factores,
-    "vulnerabilidad": {"materialidad": material, "normativa": norma, "puntaje": vuln},
-    "pesos_modelo": {"condicionantes_generacion": p_gen, "area_alcance": 1-p_gen,
-                              "amenaza": p_amenaza, "vulnerabilidad": 1-p_amenaza},
-    "resultado_exploratorio": resultado_indice,
-}
-st.download_button("Descargar ficha JSON", data=json.dumps(report, ensure_ascii=False, indent=2),
-                   file_name="georiskai_remocion_resultado.json", mime="application/json")
-st.download_button("Descargar polígono GeoJSON", data=json.dumps({"type": "Feature", "properties": {}, "geometry": mapping(polygon)}, ensure_ascii=False),
-                   file_name="poligono_estudio.geojson", mime="application/geo+json")
+if insurance_submitted:
+    if not comuna_ins:
+        st.error("Indica la comuna para buscar coincidencias.")
+        st.stop()
+    claim_support = insurance_intent.startswith("Ya ocurrió")
+    if claim_support and active_policy == "No":
+        st.warning(
+            "Una póliza contratada después del evento no cubre ese daño ya ocurrido. "
+            "Puedes cambiar a la opción de cobertura para eventos futuros."
+        )
+        insurance_matches: list[dict[str, str]] = []
+    else:
+        insurance_matches = match_insurance_partners(comuna_ins, risks_ins, claim_support)
+
+    insurance_record = {
+        "id": str(uuid.uuid4()),
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "comuna": comuna_ins,
+        "risks": risks_ins,
+        "purpose": "claim_support" if claim_support else "future_coverage",
+        "active_policy_status": active_policy,
+        "contact_name": insurance_name if consent_insurance_contact else None,
+        "email": insurance_email if consent_insurance_contact else None,
+        "phone": insurance_phone if consent_insurance_contact else None,
+        "consent_contact_sharing": consent_insurance_contact,
+        "matched_partner_names": [p.get("partner_name", "") for p in insurance_matches],
+        "match_status": "matches_found" if insurance_matches else "no_verified_match_loaded",
+    }
+    try:
+        save_insurance_request(insurance_record)
+        st.success("Solicitud de match registrada.")
+    except Exception as exc:
+        st.warning(f"No se pudo guardar la solicitud: {exc}")
+
+    if insurance_matches:
+        st.subheader("Coincidencias disponibles")
+        for partner in insurance_matches:
+            with st.container(border=True):
+                st.markdown(f"**{partner.get('partner_name', 'Intermediario')}** · {partner.get('partner_type', '')}")
+                if partner.get("product_name"):
+                    st.write("Producto/cobertura informada: " + partner["product_name"])
+                if partner.get("policy_code"):
+                    st.write("Código de póliza CMF: " + partner["policy_code"])
+                if partner.get("verified_on"):
+                    st.caption("Registro revisado: " + partner["verified_on"])
+                if partner.get("policy_url"):
+                    st.markdown(f"[Revisar condiciones de la póliza]({partner['policy_url']})")
+                if partner.get("contact_url"):
+                    st.link_button("Contactar", partner["contact_url"])
+                elif partner.get("contact_email"):
+                    st.write("Contacto: " + partner["contact_email"])
+    else:
+        st.info(
+            "Aún no hay empresas o pólizas verificadas cargadas para esta comuna y amenaza. "
+            "No mostraremos productos inventados."
+        )
+
+    if claim_support:
+        st.markdown(
+            "Para revisar pólizas que ya tienes, puedes usar el "
+            "[Sistema de Consultas de Seguros de la CMF](https://www.cmfchile.cl/portal/principal/623/w4-propertyvalue-49613.html). "
+            "GeoRiskAI no solicita ni almacena tu ClaveÚnica."
+        )
+    st.caption(
+        "El match orienta hacia intermediarios o productos cargados y verificados; "
+        "no confirma cobertura ni reemplaza la asesoría del corredor, la evaluación "
+        "de la aseguradora o la liquidación del siniestro."
+    )

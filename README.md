@@ -1,63 +1,48 @@
-# GeoRiskAI Sentinel — Remoción en masa por flujos
+# GeoRiskAI Sentinel — prototipo Streamlit
 
-## Instalación en GitHub y Streamlit Cloud
+## Qué hace esta primera versión
 
-Subir **todos** los archivos de esta carpeta a la misma carpeta de GitHub:
+- Recibe dirección, comuna, m² construidos y m² no construidos.
+- Permite subir hasta cinco fotografías.
+- Si está configurada una clave de OpenAI, solicita una estimación visual preliminar de nivel de daño/limpieza, superficie visible afectada, volumen de escombros y horas-hombre.
+- Calcula un rango de presupuesto solo cuando se ingresan tarifas reales en el panel lateral.
+- Incluye una solicitud separada para buscar orientación sobre una póliza vigente o cobertura para eventos futuros.
+- Busca coincidencias solo en `insurance_partners.csv`; el archivo parte vacío para evitar mostrar empresas o pólizas no verificadas.
+- Recibe consentimiento por separado para análisis de fotos, compartir datos con empresas y conservar fotos para mejorar el modelo.
+- Guarda las solicitudes en Supabase si está configurado; localmente usa SQLite solo para pruebas.
 
-- `app.py` (archivo principal que se selecciona en Streamlit Cloud)
-- `modelo_ird.py` (escalas y cálculo)
-- `fuentes_geo.py` (conexiones automáticas a fuentes geoespaciales)
-- `requirements.txt` (dependencias)
-- `README.md` (instrucciones)
+El prototipo no contiene tarifas de empresas verificadas ni una base de proveedores. La asignación a empresas queda pendiente de revisión manual. Las estimaciones fotográficas son experimentales y deben contrastarse con mediciones y trabajos reales antes de usarlas como cotización definitiva. El módulo de daño entrega un nivel y superficie visual afectada; todavía no calcula pérdida económica en pesos ni determina cobertura de una póliza.
 
-En Streamlit Cloud seleccionar `app.py` como **Main file path** (o `remocion_masa/app.py` si están dentro de esa carpeta). No subir el ZIP como único archivo.
-
-## Novedades de esta versión
-
-1. Al dibujar o cargar un polígono, la app **intenta consultar automáticamente** el DEM Copernicus GLO-30 mediante COG públicos en AWS. Descarga/lee las teselas necesarias y recorta el área; no descarga un DEM nacional.
-2. Calcula pendientes y elevaciones usando ese DEM, si la consulta tiene éxito. Permite subir manualmente un DEM GeoTIFF si falla.
-3. Consulta ESA WorldCover a través del catálogo STAC de Microsoft Planetary Computer para mostrar la distribución de clases de cobertura en el polígono. No presupone que esa cobertura equivalga a la clasificación de escorrentía del manual MDSF.
-4. Conserva los seis factores de amenaza del manual, incluyendo valores manuales cuando no hay fuente confiable. El suelo de fundación **no se infiere desde satélite**.
-5. Conserva las ponderaciones propias de GeoRiskAI: 66,7% amenaza; 33,3% vulnerabilidad. Dentro de vulnerabilidad: 75% materialidad; 25% antigüedad normativa.
-6. Exporta ficha JSON con las fuentes geográficas consultadas.
-
-## Limitaciones importantes
-
-- La combinación de condicionantes de generación y área de alcance sigue siendo una **hipótesis exploratoria configurable**, por defecto 50/50, pendiente de verificar en la metodología complementaria del MDSF. **No es un IRD oficial.**
-- La clasificación de WorldCover **no se transforma automáticamente** en cobertura hidrológica del manual. El evaluador selecciona cobertura y permeabilidad con evidencia adecuada.
-- No hay todavía descarga automática del catastro SERNAGEOMIN ni delimitación validada de abanicos aluviales. Los eventos históricos deben incorporarse con un protocolo de validación espacial y temporal, no como una capa de amenaza intercambiable.
-- La pendiente máxima depende de la resolución, la delimitación y la calidad del DEM. La evaluación requiere respetar la celda de análisis definida en el manual.
-- La consulta remota necesita Internet, que el servidor permita abrir COG HTTP y que los proveedores estén disponibles. Pueden existir límites de transferencia, tiempo o acceso. Las consultas automáticas se restringen a polígonos de extensión máxima aproximada de 18 km.
-- **El código fue comprobado sintácticamente, pero no se ejecutó una consulta real a las APIs desde este entorno sin acceso de red.** Si el proveedor modifica endpoints o permisos puede requerir ajustes.
-
-## Ejecutar localmente
+## Ejecutar en el computador
 
 ```bash
+python -m venv .venv
+source .venv/bin/activate
 pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Datos y trazabilidad
+En Windows, activa el entorno con `.venv\\Scripts\\activate`.
 
-- Copernicus DEM GLO-30: `https://registry.opendata.aws/copernicus-dem/`
-- ESA WorldCover: `https://esa-worldcover.org/en/data-access`
-- Planetary Computer STAC: `https://planetarycomputer.microsoft.com/api/stac/v1`
-- SERNAGEOMIN: `https://portalgeomin.sernageomin.cl/`
+Para probar solo la interfaz no necesitas OpenAI ni Supabase. Sin OpenAI, no se calcula el resultado visual. Sin Supabase, la base SQLite local sirve para pruebas, pero no es persistente al desplegar en Streamlit Community Cloud.
 
-El módulo se utiliza para evaluación preliminar de inversiones, no para reemplazar estudios geotécnicos, mapas oficiales de peligro, permisos ni decisiones de seguridad.
+## Activar análisis de fotografías
 
-## Detección automática de taludes, cauces y candidatos a abanicos (v3)
+Configura `OPENAI_API_KEY` en `.streamlit/secrets.toml` local o en Secrets de Streamlit Cloud. Las llamadas a la API pueden generar cobros según la cuenta y el uso. La app solicita consentimiento antes de enviar las fotos.
 
-Después de seleccionar el polígono y obtener el DEM, pulsar **Detectar taludes, cauces y posibles abanicos**. `deteccion_terreno.py` calcula distancias mínimas del polígono a taludes potenciales (pendiente >=30° y relieve local >=8 m), consulta cauces de OpenStreetMap mediante Overpass, y obtiene una aproximación de drenaje topográfico mediante concavidad del DEM. Detecta *candidatos* a abanicos mediante condiciones heurísticas de pendiente moderada, cercanía a ladera y convergencia; **NO confirma abanicos aluviales ni asigna automáticamente su puntaje de amenaza**. Las distancias y el indicador se incorporan a la ficha JSON.
+## Guardar solicitudes en Supabase
 
-**Limitaciones:** las distancias se refieren a las geometrías disponibles dentro del DEM y/o a la cobertura OSM; no implican inventario exhaustivo. Los cauces OSM no son necesariamente cauces de flujo aluvional y su ausencia no descarta amenaza. La distancia a cauce **no reemplaza** el subfactor MDSF "distancia a intervenciones del cauce". Para análisis riguroso se requiere DEM con área de aporte aguas arriba, inventario oficial de abanicos/cauces, delimitación geomorfológica y verificación experta. No se han probado las APIs remotas desde este entorno.
+1. Crea un proyecto Supabase.
+2. Ejecuta `schema_supabase.sql` en el SQL Editor.
+3. Copia `SUPABASE_URL` y `SUPABASE_ANON_KEY` desde el proyecto a Secrets.
+4. No publiques `secrets.toml` ni claves privadas en el repositorio.
 
-## Actualización: drenajes y abanicos derivados del DEM
+La tabla tiene inserción anónima para este piloto y no permite leer las solicitudes desde la app. Administra y revisa los registros desde Supabase. Antes de abrir el piloto al público, agrega controles contra spam, autenticación administrativa y una política de privacidad adecuada.
 
-`deteccion_terreno.py` ya no depende de que OpenStreetMap tenga cartografiadas las quebradas. Usa un algoritmo **priority-flood con acumulación de flujo D8** sobre un DEM métrico, detecta drenajes por área contribuyente mínima configurable (1–100 ha), delimita taludes potenciales y genera **candidatos topográficos** a abanicos cerca de transiciones entre laderas empinadas y piedemonte. Los resultados se dibujan en un segundo mapa de Streamlit.
+## Cargar intermediarios y pólizas para el match
 
-**Limitaciones esenciales:** la cuenca aportante puede extenderse fuera del recorte DEM (se amplió el contexto por defecto a 2 km); los cauces son simulados y no verificados; la existencia y geometría de abanicos NO pueden confirmarse únicamente con pendiente y acumulación de flujo. Para evaluación normativa deben contrastarse con geomorfología, depósitos, ortofotos y cartografía oficial. En abanicos complejos se recomienda un DEM de mayor resolución y delineación de cuenca aguas arriba. La salida no asigna automáticamente una categoría de amenaza MDSF.
+Completa `insurance_partners.csv` solo después de revisar los antecedentes del corredor, liquidador o aseguradora y las condiciones de la póliza. `communes` y `risks` aceptan varios valores separados por `|`; usa `*` en `communes` para cobertura nacional. Marca `verified=true` y `active=true` solo tras revisar la vigencia en la CMF. El match filtra por comuna, amenaza y tipo de solicitud. No es una validación automática de cobertura.
 
-### Prueba local
+## Despliegue en Streamlit Community Cloud
 
-`python -m pytest -q test_modelo_ird.py test_deteccion.py`
+Sube `app.py`, `requirements.txt` y `schema_supabase.sql` a un repositorio GitHub. En Streamlit Community Cloud selecciona ese repositorio y como archivo principal `app.py`. Después configura las claves en la sección Secrets de la app.
