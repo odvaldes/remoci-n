@@ -1,6 +1,6 @@
 # GeoRiskAI Relaves — prototipo Streamlit
 
-MVP para explorar depósitos de relaves, señales históricas de Sentinel-1, exposición de comunidades y una ruta de entrenamiento supervisado. Caso demo referencial: Las Tórtolas, Colina.
+MVP para explorar los polígonos nacionales de depósitos de relaves SERNAGEOMIN, cartografía censal INE 2024 cercana, señales históricas de Sentinel-1, exposición de comunidades y una ruta de entrenamiento supervisado. Caso inicial: Las Tórtolas, Colina.
 
 ## Ejecutar
 
@@ -16,20 +16,22 @@ streamlit run app.py
 2. Crear `.streamlit/secrets.toml` a partir de `.streamlit_secrets.example.toml`.
 3. Ejecutar la app y consultar un intervalo temporal.
 
-El prototipo divide el periodo en intervalos de seis meses y permite descargar VV/VH como GeoTIFF. Las bandas no se convierten en nivel de inundación ni probabilidad de falla. Para operacionalizar debe añadirse calibración radiométrica/geométrica, máscara de agua validada, mosaicos consistentes, DEM y validación en terreno.
+El prototipo muestra el polígono de todos los relaves del servicio areal de SERNAGEOMIN; al seleccionar un sitio carga manzanas urbanas y entidades rurales censales del INE 2024 en el radio escogido. El mapa usa colores y borde discontinuo para distinguirlas. El prototipo consulta hasta ocho ventanas históricas distribuidas en el periodo seleccionado y permite descargar VV/VH como GeoTIFF. Las bandas no se convierten en nivel de inundación ni probabilidad de falla. Para operacionalizar debe añadirse calibración radiométrica/geométrica, máscara de agua validada, mosaicos consistentes, DEM y validación en terreno.
 
 ## Límites que deben mantenerse visibles
 
 - No estima probabilidad de colapso ni sustituye estudios de estabilidad, mapas oficiales de inundación, planes de emergencia o decisiones de autoridad.
 - El radar observa cambios superficiales; puede confundir agua, humedad, obras, vegetación y geometría.
-- El punto de Las Tórtolas es aproximado para demo. Reemplazarlo por geometría oficial del catastro vigente.
+- La geometría del catastro areal es una referencia de SERNAGEOMIN, no una delimitación jurídica ni una evaluación de estabilidad. El servicio consultado se denomina CDR_CHILE_AREAL_2025 y declara actualización a octubre de 2025.
+- Las manzanas urbanas y entidades rurales provienen de cartografía censal INE 2024; no representan necesariamente ocupación actual parcela a parcela ni sustituyen validación municipal/terreno.
+- La cobertura depende de que los servicios ArcGIS estén disponibles y de la conectividad de Streamlit.
 - Falta integrar un catastro de población/comunidades validado, hidrografía, elevación y escenarios hidráulicos de rotura.
 - Un modelo supervisado sólo debe entrenarse con eventos y no eventos verificados, fuentes citables y evaluación por depósito separado (sin fuga espacial/temporal).
 
 ## Siguiente etapa de datos
 
-1. Servicio/catastro vigente de SERNAGEOMIN y polígono del depósito.
-2. Comunidades y población: INE/Censo, municipalidad, localidades; resguardar datos personales.
+1. Servicio/catastro vigente de SERNAGEOMIN y polígono areal del depósito.
+2. Comunidades y población: cartografía Censo INE 2024, municipalidad y localidades; integrar población sólo en agregados y resguardar datos personales.
 3. Sentinel-1 histórico y Sentinel-2 óptico; revisar cuerpos de agua contra lluvia, inspecciones y registros de operación.
 4. Modelo digital de elevación, drenaje y escenarios hidráulicos elaborados por especialistas.
 5. Etiquetas de incidentes: registros de autoridad, monitoreo, inspección y ejercicios; separar categorías (incidente, anomalía, inundación observada, falla).
