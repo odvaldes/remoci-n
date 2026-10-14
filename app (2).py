@@ -27,6 +27,7 @@ CDSE_PROCESS_URL = "https://sh.dataspace.copernicus.eu/process/v1"
 SERNAGEOMIN_LAYER = "https://services1.arcgis.com/OyjvVdFTl5hfSdX3/ArcGIS/rest/services/CDR_CHILE_AREAL_2025/FeatureServer/0"
 INE_URBAN_LAYER = "https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/MANZANAS_2024/FeatureServer/0"
 INE_RURAL_LAYER = "https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/ENTIDADES_2024/FeatureServer/0"
+INE_CENSUS_ZONES_LAYER = "https://services.arcgis.com/r7t1P5pnkoOLRdhr/arcgis/rest/services/Microdatos_Censo_2024/FeatureServer/3"
 DGA_CAUCES_LAYER = "https://rest-sit.mop.gob.cl/arcgis/rest/services/SNIA/SNIA_CAUCES/MapServer/0"
 BNA_BASINS_LAYER = "https://services.arcgis.com/r7t1P5pnkoOLRdhr/ArcGIS/rest/services/Cuencas/FeatureServer/0"
 
@@ -164,6 +165,52 @@ def load_ine_nearby(lat: float, lon: float, radius_km: int) -> tuple[list[dict],
         except Exception as e:
             errors.append(f"{layer_name}: {str(e)[:160]}")
     return result, errors
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_ine_urban_zones(lat: float, lon: float, radius_km: int) -> tuple[list[dict], str | None]:
+    """Carga zonas censales INE 2024 cercanas como referencia de tejido urbano."""
+    dlat = radius_km / 111.0
+    dlon = radius_km / (111.0 * max(.2, math.cos(math.radians(lat))))
+    envelope = f"{lon-dlon},{lat-dlat},{lon+dlon},{lat+dlat}"
+    result = []
+    offset = 0
+    try:
+        while offset < 6000:
+            params = {
+                "where": "1=1", "outFields": "NOM_REGION,NOM_PROVINCIA,NOM_COMUNA,NOM_DISTRITO,COD_ZONA,NOM_LOCALIDAD,AREA_C",
+                "returnGeometry": "true", "outSR": "4326", "geometry": envelope,
+                "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+                "spatialRel": "esriSpatialRelIntersects", "geometryPrecision": 5,
+                "f": "geojson", "resultOffset": offset, "resultRecordCount": 1000,
+            }
+            response = requests.get(f"{INE_CENSUS_ZONES_LAYER}/query", params=params, timeout=75)
+            response.raise_for_status()
+            page = response.json()
+            if "error" in page:
+                raise RuntimeError(page["error"].get("message", "Error de consulta de zonas INE"))
+            batch = page.get("features", [])
+            for feat in batch:
+                p = feat.get("properties") or {}
+                feat["properties"] = {
+                    "capa": "Zonas censales INE 2024",
+                    "comuna": str(p.get("NOM_COMUNA") or ""),
+                    "zona": str(p.get("COD_ZONA") or ""),
+                    "distrito": str(p.get("NOM_DISTRITO") or ""),
+                    "localidad": str(p.get("NOM_LOCALIDAD") or ""),
+                    "estrato": str(p.get("AREA_C") or ""),
+                }
+                result.append({"type": "Feature", "geometry": feat.get("geometry"), "properties": feat["properties"], "color": "#7b61a8"})
+            if not page.get("exceededTransferLimit") and len(batch) < 1000:
+                break
+            if not batch:
+                break
+            offset += len(batch)
+        if offset >= 6000:
+            return result, "Consulta de zonas censales limitada a 6.000 polígonos."
+        return result, None
+    except Exception as e:
+        return [], str(e)[:180]
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -366,6 +413,7 @@ with left:
     st.markdown("#### Área del relave y entorno censal")
     if map_mode == "Entorno del depósito":
         nearby, nearby_errors = load_ine_nearby(lat, lon, radius_km) if show_communities else ([], [])
+        urban_zones, urban_zone_error = load_ine_urban_zones(lat, lon, radius_km)
         cauces, hydro_error = load_cauces_nearby(lat, lon, radius_km)
         basin_feature, basin_error = load_dga_basin(lat, lon)
         hydro_status, hydro_count = assess_hydro_connection(
@@ -375,6 +423,7 @@ with left:
         map_zoom = 12
     else:
         nearby, nearby_errors = [], []
+        urban_zones, urban_zone_error = [], None
         basin_feature, basin_error = None, None
         cauces, hydro_error, hydro_status, hydro_count = [], None, "Selecciona el entorno de un depósito para revisar continuidad hidrográfica.", 0
         map_center = [-35.6, -71.4]
@@ -420,6 +469,13 @@ with left:
         folium.GeoJson(urban_fc, name="Áreas censales cercanas · INE 2024",
                        style_function=census_style,
                     tooltip=folium.GeoJsonTooltip(fields=["capa", "comuna", "id"], aliases=["Capa censal", "Comuna", "Código censal/INE"])).add_to(fmap)
+    if urban_zones:
+        zones_fc = {"type": "FeatureCollection", "features": urban_zones}
+        folium.GeoJson(
+            zones_fc, name="Zonas censales INE 2024",
+            style_function=lambda feature: {"color": "#7652a8", "weight": 2, "fillColor": "#9a78c9", "fillOpacity": .12, "dashArray": "3, 3"},
+            tooltip=folium.GeoJsonTooltip(fields=["comuna", "distrito", "zona", "localidad", "estrato"], aliases=["Comuna", "Distrito", "Código de zona", "Localidad", "Estrato censal"]),
+        ).add_to(fmap)
     if cauces:
         hydro_fc = {"type": "FeatureCollection", "features": cauces}
         def hydro_style(feature):
@@ -435,11 +491,13 @@ with left:
     folium.LayerControl(collapsed=False).add_to(fmap)
     st_folium(fmap, height=570, use_container_width=True, returned_objects=[])
     if sites:
-        st.caption("El mapa abre en imagen satelital Esri; en el control de capas puedes cambiar a calles. Morado: relaves nacionales. Rojo: depósito seleccionado. Turquesa: manzanas urbanas INE 2024. Naranjo: entidades rurales INE 2024. Azul: cauces y quebradas DGA/MOP.")
+        st.caption("El mapa abre en imagen satelital Esri; en el control de capas puedes cambiar a calles. Morado: relaves nacionales; rojo: depósito seleccionado; turquesa: manzanas urbanas; naranjo: entidades rurales; violeta rayado: zonas censales INE 2024; azul: cauces y quebradas DGA/MOP.")
     if nearby_errors:
         st.warning("Algunas capas censales no se pudieron cargar: " + " · ".join(nearby_errors))
     if hydro_error:
         st.warning("No se pudo cargar la red hidrográfica DGA/MOP: " + hydro_error)
+    if urban_zone_error:
+        st.warning("No se pudo cargar la capa de zonas censales INE: " + urban_zone_error)
     if basin_error:
         st.warning("No se pudo identificar la cuenca BNA: " + basin_error)
     if basin_feature:
@@ -582,4 +640,4 @@ colC.markdown("**Independencia verificable**\n\nMetodología pública, auditorí
 st.caption("La plataforma ayuda a priorizar análisis y coordinación. Alarmas, evacuaciones, declaraciones de seguridad y mapas de inundación por falla deben quedar en manos de autoridades y especialistas competentes.")
 
 with st.expander("Fuentes y siguientes integraciones"):
-    st.markdown("- [SERNAGEOMIN: Catastro areal nacional de relaves](https://services1.arcgis.com/OyjvVdFTl5hfSdX3/ArcGIS/rest/services/CDR_CHILE_AREAL_2025/FeatureServer)\n- [INE: manzanas urbanas Censo 2024](https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/MANZANAS_2024/FeatureServer)\n- [INE: entidades rurales Censo 2024](https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/ENTIDADES_2024/FeatureServer)\n- [DGA/MOP: red de cauces de Chile](https://rest-sit.mop.gob.cl/arcgis/rest/services/SNIA/SNIA_CAUCES/MapServer/0)\n- [DGA: Mapoteca digital (cuencas BNA y balance hídrico)](https://dga.mop.gob.cl/mapoteca-digital/)\n- [DGA: estadísticas de estaciones hidrométricas](https://dga.mop.gob.cl/estadisticas-estaciones-dga/)\n- [DGA/U. de Chile: actualización del balance hídrico nacional 1985–2015 y proyecciones 2030–2060](https://www.balancehidrico.uchile.cl/)\n- [Copernicus Data Space: DEM](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Data/DEM.html)\n- [Copernicus Data Space: Sentinel Hub y autenticación OAuth](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Overview/Authentication.html)\n- [Copernicus: ejemplo Sentinel-1 GRD](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Process/Examples/S1GRD.html)\n- [Copernicus: catálogo STAC](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Catalog.html)\n- [Consejo Minero: ficha Las Tórtolas](https://consejominero.cl/operaciones/las-tortolas/)\n- [Municipalidad de Colina: ejercicio de emergencia con comunidades](https://www.colina.cl/colina-y-tiltil-reforzaron-protocolos-de-emergencia-ante-eventuales-eventos-en-relaves-las-tortolas/)")
+        st.markdown("- [SERNAGEOMIN: Catastro areal nacional de relaves](https://services1.arcgis.com/OyjvVdFTl5hfSdX3/ArcGIS/rest/services/CDR_CHILE_AREAL_2025/FeatureServer)\n- [INE: manzanas urbanas Censo 2024](https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/MANZANAS_2024/FeatureServer)\n- [INE: entidades rurales Censo 2024](https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/ENTIDADES_2024/FeatureServer)\n- [INE: zonas censales Censo 2024](https://services.arcgis.com/r7t1P5pnkoOLRdhr/arcgis/rest/services/Microdatos_Censo_2024/FeatureServer/3)\n- [DGA/MOP: red de cauces de Chile](https://rest-sit.mop.gob.cl/arcgis/rest/services/SNIA/SNIA_CAUCES/MapServer/0)\n- [DGA: Mapoteca digital (cuencas BNA y balance hídrico)](https://dga.mop.gob.cl/mapoteca-digital/)\n- [DGA: estadísticas de estaciones hidrométricas](https://dga.mop.gob.cl/estadisticas-estaciones-dga/)\n- [DGA/U. de Chile: actualización del balance hídrico nacional 1985–2015 y proyecciones 2030–2060](https://www.balancehidrico.uchile.cl/)\n- [Copernicus Data Space: DEM](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Data/DEM.html)\n- [Copernicus Data Space: Sentinel Hub y autenticación OAuth](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Overview/Authentication.html)\n- [Copernicus: ejemplo Sentinel-1 GRD](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Process/Examples/S1GRD.html)\n- [Copernicus: catálogo STAC](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Catalog.html)\n- [Consejo Minero: ficha Las Tórtolas](https://consejominero.cl/operaciones/las-tortolas/)\n- [Municipalidad de Colina: ejercicio de emergencia con comunidades](https://www.colina.cl/colina-y-tiltil-reforzaron-protocolos-de-emergencia-ante-eventuales-eventos-en-relaves-las-tortolas/)")

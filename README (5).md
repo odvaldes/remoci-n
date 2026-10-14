@@ -1,6 +1,6 @@
 # GeoRiskAI Relaves — prototipo Streamlit
 
-MVP para explorar los polígonos nacionales de depósitos de relaves SERNAGEOMIN, cartografía censal INE 2024 urbana y rural cercana, red hidrográfica DGA/MOP (incluye cauces y quebradas), cuencas BNA atribuidas a DGA y contexto del Balance Hídrico Nacional, señales históricas de Sentinel-1, exposición de comunidades y una ruta de entrenamiento supervisado. Caso inicial: Las Tórtolas, Colina.
+MVP para explorar los polígonos nacionales de depósitos de relaves SERNAGEOMIN, cartografía censal INE 2024 de manzanas urbanas, entidades rurales y zonas censales urbanas cercanas, red hidrográfica DGA/MOP (incluye cauces y quebradas), cuencas BNA atribuidas a DGA y contexto del Balance Hídrico Nacional, señales históricas de Sentinel-1, exposición de comunidades y una ruta de entrenamiento supervisado. Caso inicial: Las Tórtolas, Colina.
 
 ## Ejecutar
 
@@ -23,7 +23,7 @@ El prototipo muestra el polígono de todos los relaves del servicio areal de SER
 - No estima probabilidad de colapso ni sustituye estudios de estabilidad, mapas oficiales de inundación, planes de emergencia o decisiones de autoridad.
 - El radar observa cambios superficiales; puede confundir agua, humedad, obras, vegetación y geometría.
 - La geometría del catastro areal es una referencia de SERNAGEOMIN, no una delimitación jurídica ni una evaluación de estabilidad. El servicio consultado se denomina CDR_CHILE_AREAL_2025 y declara actualización a octubre de 2025.
-- Las manzanas urbanas y entidades rurales provienen de cartografía censal INE 2024; no representan necesariamente ocupación actual parcela a parcela ni sustituyen validación municipal/terreno. El chequeo de continuidad con la red de cauces DGA/MOP es aproximado: no determina sentido del flujo, caudal, inundación ni alcance de una eventual falla. Un resultado negativo tampoco descarta quebradas menores ausentes de la cartografía.
+- Las manzanas urbanas, entidades rurales y zonas censales provienen de cartografía censal INE 2024; no representan necesariamente ocupación actual parcela a parcela ni sustituyen validación municipal/terreno. El chequeo de continuidad con la red de cauces DGA/MOP es aproximado: no determina sentido del flujo, caudal, inundación ni alcance de una eventual falla. Un resultado negativo tampoco descarta quebradas menores ausentes de la cartografía.
 - La cobertura depende de que los servicios ArcGIS estén disponibles y de la conectividad de Streamlit.
 - La capa DGA/MOP de cauces está integrada para screening. Falta validar localidades y ocupación en terreno, añadir un modelo de elevación para inferir dirección de flujo y cuencas, y modelar escenarios hidráulicos de rotura.
 - Un modelo supervisado sólo debe entrenarse con eventos y no eventos verificados, fuentes citables y evaluación por depósito separado (sin fuga espacial/temporal).
