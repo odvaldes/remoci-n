@@ -46,6 +46,19 @@ COPERNICUS_LC2019 = (
     "PROBAV_LC100_global_v3.0.1_2019-nrt_Discrete-Classification-map_EPSG-4326.tif?download=1"
 )
 SERNAGEOMIN_WEBMAP_ID = "bd82ae84d40643019878dea882335381"
+CITSU_COQUIMBO_LASERENA_KMZ = (
+    "https://www.shoa.cl/s3/shoa-cl/descargas/citsu/kmz/"
+    "CITSU_Coquimbo_La_Serena_2da_Ed_2015.kmz"
+)
+VOLCANO_HAZARD_LAYER = (
+    "https://services3.arcgis.com/uZrwedu11XCCdHk1/ArcGIS/rest/services/"
+    "Riesgo_Volc%C3%A1nico/FeatureServer/6"
+)
+DGA_MAI_MATAQUITO_ZIP = (
+    "https://dga.mop.gob.cl/uploads/sites/13/2025/12/"
+    "03_KMZ-20251231T144439Z-1-001.zip"
+)
+DOH_FLOOD_POINTS_LAYER = "https://rest-sit.mop.gob.cl/arcgis/rest/services/DOH/SIALL/MapServer/10"
 SERNAGEOMIN_EVENTS_LAYER = (
     "https://services3.arcgis.com/uZrwedu11XCCdHk1/arcgis/rest/services/"
     "M5T7___Mapa___Remociones_en_Masa__Chile_1962_2021__WFL1/FeatureServer/0"
@@ -121,22 +134,40 @@ def load_remote_kmz(url):
 
 @st.cache_data(ttl=86400, show_spinner=False)
 def load_arcgis_geojson(layer_url, bbox):
-    """Fetch features intersecting [west, south, east, north] in EPSG:4326."""
-    response = requests.get(
-        layer_url.rstrip("/") + "/query",
-        params={
-            "where": "1=1", "outFields": "*", "returnGeometry": "true",
-            "outSR": "4326", "f": "geojson", "resultRecordCount": 1500,
-            "geometry": ",".join(str(v) for v in bbox),
-            "geometryType": "esriGeometryEnvelope", "inSR": "4326",
-            "spatialRel": "esriSpatialRelIntersects",
-        },
-        timeout=30,
-    )
+    """Consulta ArcGIS y normaliza su respuesta GeoJSON/EsriJSON a EPSG:4326."""
+    query_url = layer_url.rstrip("/") + "/query"
+    common = {
+        "where": "1=1", "outFields": "*", "returnGeometry": "true",
+        "outSR": "4326", "resultRecordCount": 1500,
+        "geometry": ",".join(str(v) for v in bbox),
+        "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+        "spatialRel": "esriSpatialRelIntersects",
+    }
+    response = requests.get(query_url, params={**common, "f": "geojson"}, timeout=30)
     response.raise_for_status()
     data = response.json()
     if data.get("error"):
-        raise RuntimeError(data["error"].get("message", "Error de ArcGIS"))
+        response = requests.get(query_url, params={**common, "f": "json"}, timeout=30)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("error"):
+            raise RuntimeError(data["error"].get("message", "Error de ArcGIS"))
+        features = []
+        for feature in data.get("features", []):
+            geom = feature.get("geometry") or {}
+            geometry = None
+            if "x" in geom and "y" in geom:
+                geometry = {"type": "Point", "coordinates": [geom["x"], geom["y"]]}
+            elif geom.get("paths"):
+                paths = geom["paths"]
+                geometry = {"type": "LineString", "coordinates": paths[0]} if len(paths) == 1 else {"type": "MultiLineString", "coordinates": paths}
+            elif geom.get("rings"):
+                rings = geom["rings"]
+                # Para polygonal ArcGIS, conserva los anillos; GeoJSON interpreta primer anillo como exterior.
+                geometry = {"type": "Polygon", "coordinates": rings}
+            if geometry:
+                features.append({"type": "Feature", "properties": feature.get("attributes", {}), "geometry": geometry})
+        return {"type": "FeatureCollection", "features": features}
     return data
 
 
@@ -162,6 +193,18 @@ def load_sernageomin_hazard_layers(bbox):
     if not layers and errors:
         raise RuntimeError("No se pudo consultar ninguna capa vectorial: " + "; ".join(errors[:2]))
     return layers
+
+
+@st.cache_data(ttl=7*86400, show_spinner=False)
+def load_dga_mai_mataquito(url):
+    """Descarga la capa KMZ oficial de amenaza de inundación de la cuenca Mataquito."""
+    response = requests.get(url, timeout=60)
+    response.raise_for_status()
+    with zipfile.ZipFile(io.BytesIO(response.content)) as archive:
+        kmz_name = next((n for n in archive.namelist() if n.lower().endswith(".kmz")), None)
+        if not kmz_name:
+            raise ValueError("El ZIP de DGA no contiene un KMZ.")
+        return parse_kmz(archive.read(kmz_name))
 
 
 def count_layer_intersections(polygon, geojson):
@@ -404,7 +447,22 @@ def analyze_dem(dem_source, polygon):
         slope[0, :] = np.nan; slope[-1, :] = np.nan
         slope[:, 0] = np.nan; slope[:, -1] = np.nan
         finite = slope[np.isfinite(slope)]
-        elev = dst[np.isfinite(dst)]
+        valid_elev = np.isfinite(dst)
+        elev = dst[valid_elev]
+        low30 = valid_elev & (dst <= 30.0)
+        cota30_pct = 100.0 * np.count_nonzero(low30) / max(1, np.count_nonzero(valid_elev))
+        cota30_features = []
+        if np.any(low30):
+            from rasterio.features import shapes as raster_shapes
+            to_wgs84 = Transformer.from_crs(target_crs, "EPSG:4326", always_xy=True)
+            for geom, value in raster_shapes(low30.astype("uint8"), mask=low30, transform=dst_transform):
+                if value != 1:
+                    continue
+                polygon_utm = shape(geom)
+                if polygon_utm.area < 700:
+                    continue
+                polygon_wgs = shapely_transform(to_wgs84.transform, polygon_utm)
+                cota30_features.append({"type": "Feature", "properties": {"elevacion": "≤30 m"}, "geometry": mapping(polygon_wgs)})
         if finite.size == 0:
             raise ValueError("No se obtuvieron pendientes válidas.")
         return {
@@ -415,6 +473,10 @@ def analyze_dem(dem_source, polygon):
             "elevacion_max_m": round(float(np.max(elev)), 1),
             "resolucion_m_aprox": round(float(max(dx, dy)), 1),
             "pixeles_pendiente_validos": int(finite.size),
+            "porcentaje_poligono_cota30_o_menor": round(float(cota30_pct), 2),
+            "area_poligono_cota30_o_menor_ha": round(float(cota30_pct) * geometry_area_ha(polygon) / 100, 4),
+            "fuente_cota30": "Umbral de elevación Copernicus GLO-30 <= 30 m; referencia topográfica, no zona oficial de evacuación",
+            "cota30_geojson": {"type": "FeatureCollection", "features": cota30_features},
         }
 
 with st.sidebar:
@@ -426,6 +488,9 @@ with st.sidebar:
     show_prc = st.checkbox("Mostrar zonas de riesgo del PRC", value=True)
     show_sernageomin = st.checkbox("Mostrar mapas/capas SERNAGEOMIN", value=True)
     show_sngm_events = st.checkbox("Mostrar catastro histórico SERNAGEOMIN (1962–2021)", value=True)
+    show_citsu = st.checkbox("Mostrar CITSU SHOA Coquimbo–La Serena", value=True)
+    show_volcano = st.checkbox("Mostrar peligro volcánico SERNAGEOMIN", value=True)
+    show_flood = st.checkbox("Mostrar mapas/catastros de inundación DGA/MOP", value=True)
     st.header("Datos de elevación")
     st.caption("El DEM Copernicus GLO-30 se consulta automáticamente para el polígono. También puedes cargar un DEM local para reemplazarlo.")
     dem_upload = st.file_uploader("DEM GeoTIFF (opcional)", type=["tif", "tiff"])
@@ -444,6 +509,9 @@ prc_data = None
 prc_geojson_layers = []
 sernageomin_layers = []
 sernageomin_events = None
+citsu_data = None
+volcano_data = None
+flood_layers = []
 source_messages = []
 if show_prc:
     if pilot_comuna in {"La Serena", "La Serena y Coquimbo"}:
@@ -495,6 +563,45 @@ if show_sngm_events:
     except Exception as exc:
         source_messages.append(f"No se pudo consultar el catastro histórico de SERNAGEOMIN: {exc}")
 
+if show_citsu:
+    try:
+        citsu_data = load_remote_kmz(CITSU_COQUIMBO_LASERENA_KMZ)
+        folium.GeoJson(citsu_data, name="SHOA · CITSU Coquimbo–La Serena (2.ª ed., 2015)",
+            style_function=lambda _f: {"color": "#005a8d", "weight": 1.4, "fillColor": "#00a6d6", "fillOpacity": 0.35},
+            tooltip=folium.GeoJsonTooltip(fields=["nombre"], aliases=["Zona CITSU"])).add_to(m)
+    except Exception as exc:
+        source_messages.append(f"No se pudo cargar CITSU SHOA Coquimbo–La Serena: {exc}")
+
+if show_volcano:
+    try:
+        volcano_data = load_arcgis_geojson(VOLCANO_HAZARD_LAYER, map_config["bbox"])
+        if volcano_data.get("features"):
+            folium.GeoJson(volcano_data, name="Peligro volcánico nacional · servicio ArcGIS",
+                style_function=lambda _f: {"color": "#7f1d1d", "weight": 1.2, "fillColor": "#dc2626", "fillOpacity": 0.35},
+                tooltip=folium.GeoJsonTooltip(fields=["volcan", "peligro"], aliases=["Volcán", "Peligro"], labels=True)).add_to(m)
+    except Exception as exc:
+        source_messages.append(f"No se pudo consultar la capa SERNAGEOMIN de peligro volcánico: {exc}")
+
+if show_flood:
+    try:
+        # El mapa DGA disponible en este servicio cubre la cuenca Mataquito; solo aparecerá si intersecta el área visible.
+        flood_data = load_dga_mai_mataquito(DGA_MAI_MATAQUITO_ZIP)
+        flood_layers.append({"name": "DGA · amenaza de inundación río Mataquito (2025)", "data": flood_data})
+        folium.GeoJson(flood_data, name="DGA · amenaza de inundación río Mataquito (2025)",
+            style_function=lambda _f: {"color": "#1565c0", "weight": 1.2, "fillColor": "#42a5f5", "fillOpacity": 0.28},
+            tooltip=folium.GeoJsonTooltip(fields=["nombre"], aliases=["Área DGA"])).add_to(m)
+    except Exception as exc:
+        source_messages.append(f"No se pudo cargar el mapa de amenaza DGA-Mataquito: {exc}")
+    try:
+        flood_points = load_arcgis_geojson(DOH_FLOOD_POINTS_LAYER, map_config["bbox"])
+        if flood_points.get("features"):
+            flood_layers.append({"name": "DOH · puntos referenciales de inundación", "data": flood_points})
+            folium.GeoJson(flood_points, name="DOH · puntos referenciales de inundación",
+                marker=folium.CircleMarker(radius=5, color="#1565c0", fill=True, fill_color="#29b6f6", fill_opacity=.9),
+                tooltip=folium.GeoJsonTooltip(fields=["NOMBRE"], aliases=["Punto de inundación"])).add_to(m)
+    except Exception as exc:
+        source_messages.append(f"No se pudo consultar el catastro DOH de inundaciones: {exc}")
+
 Draw(export=False, draw_options={"polyline": False, "rectangle": True, "circle": False,
     "circlemarker": False, "marker": False}, edit_options={"edit": True, "remove": True}).add_to(m)
 folium.LayerControl().add_to(m)
@@ -511,7 +618,9 @@ st.markdown(
     "[Mapa SERNAGEOMIN de susceptibilidad de flujos](https://www.arcgis.com/apps/mapviewer/index.html?webmap=bd82ae84d40643019878dea882335381) · "
     "[SERNAGEOMIN Coquimbo Norte, IR-18-68](https://catalogobiblioteca.sernageomin.cl/Archivos/15633%20-texto%20y%20mapa-red.pdf) · "
     "[SERNAGEOMIN Coquimbo Sur, IR-21-88](https://portalgeo.sernageomin.cl/Informes_PDF_Nac/RM-2021-01.pdf) · "
-    "[Catastro histórico SERNAGEOMIN](https://services3.arcgis.com/uZrwedu11XCCdHk1/arcgis/rest/services/M5T7___Mapa___Remociones_en_Masa__Chile_1962_2021__WFL1/FeatureServer)"
+    "[Catastro histórico SERNAGEOMIN](https://services3.arcgis.com/uZrwedu11XCCdHk1/arcgis/rest/services/M5T7___Mapa___Remociones_en_Masa__Chile_1962_2021__WFL1/FeatureServer) · "
+    "[CITSU SHOA](https://www.shoa.cl/php/citsu.php) · [Peligro volcánico nacional](https://services3.arcgis.com/uZrwedu11XCCdHk1/ArcGIS/rest/services/Riesgo_Volc%C3%A1nico/FeatureServer/6) · [Catálogo de mapas SERNAGEOMIN](https://portalgeomin.sernageomin.cl/service/60de3ded818938000000) · "
+    "[Amenaza de inundación DGA](https://dga.mop.gob.cl/mapas-de-amenaza-de-inundacion/) · [Geoportal MINVU](https://ide.minvu.cl/)"
 )
 
 polygon = None
@@ -541,11 +650,18 @@ st.subheader("Cruce con cartografía de referencia")
 prc_hits = sum(count_layer_intersections(polygon, layer["data"]) for layer in prc_geojson_layers)
 sngm_hazard_hits = sum(count_layer_intersections(polygon, layer["data"]) for layer in sernageomin_layers)
 sngm_event_hits = count_layer_intersections(polygon, sernageomin_events)
+citsu_hits = count_layer_intersections(polygon, citsu_data)
+volcano_hits = count_layer_intersections(polygon, volcano_data)
+flood_hits = sum(count_layer_intersections(polygon, layer["data"]) for layer in flood_layers)
 hits = st.columns(3)
 hits[0].metric("Elementos PRC intersectados", prc_hits if prc_geojson_layers else "Sin capa")
 hits[1].metric("Polígonos SERNAGEOMIN intersectados", sngm_hazard_hits if sernageomin_layers else "Sin capa")
-hits[2].metric("Eventos históricos intersectados", sngm_event_hits if sernageomin_events else "Sin capa")
-st.caption("El cruce indica intersección geométrica con las capas cargadas; no determina por sí solo exposición, nivel de riesgo, permiso de edificación ni peligro actual.")
+hits[2].metric("CITSU intersectada", citsu_hits if citsu_data else "Sin capa")
+hits2 = st.columns(3)
+hits2[0].metric("Zonas volcánicas intersectadas", volcano_hits if volcano_data else "Sin capa")
+hits2[1].metric("Capas/puntos de inundación", flood_hits if flood_layers else "Sin capa")
+hits2[2].metric("Eventos históricos SERNAGEOMIN", sngm_event_hits if sernageomin_events else "Sin capa")
+st.caption("El cruce indica intersección geométrica con las capas cargadas; no determina por sí solo exposición, nivel de riesgo, permiso de edificación ni peligro actual. La capa volcánica nacional es referencial; los mapas SERNAGEOMIN tienen escalas, fechas y coberturas distintas.")
 
 result = {"superficie_ha": round(area, 4), "fuente": "polígono suministrado por el usuario"}
 dem_source = None
@@ -578,6 +694,16 @@ if dem_source is not None:
         cols[1].metric("Pendiente p95", f"{result['pendiente_p95_grados']}°")
         cols[2].metric("Elevación mínima", f"{result['elevacion_min_m']} m")
         cols[3].metric("Elevación máxima", f"{result['elevacion_max_m']} m")
+        st.metric("Superficie del polígono a cota ≤30 m", f"{result['porcentaje_poligono_cota30_o_menor']}% · {result['area_poligono_cota30_o_menor_ha']} ha")
+        st.caption("La cota 30 se deriva del DEM dentro del polígono; no sustituye la carta CITSU ni la línea oficial de seguridad/evacuación.")
+        if result.get("cota30_geojson", {}).get("features"):
+            folium.GeoJson({"type": "Feature", "properties": {"área": "Polígono analizado"}, "geometry": mapping(polygon)},
+                name="Polígono analizado", style_function=lambda _f: {"color": "#222222", "weight": 2, "fillOpacity": 0}).add_to(m)
+            folium.GeoJson(result["cota30_geojson"], name="Copernicus · terreno ≤30 m dentro del polígono",
+                style_function=lambda _f: {"color": "#0b79a5", "weight": 1, "fillColor": "#45c4e8", "fillOpacity": .65},
+                tooltip=folium.GeoJsonTooltip(fields=["elevacion"], aliases=["Cota"])).add_to(m)
+            st.caption("Mapa resultante: azul = píxeles del predio con elevación DEM ≤30 m; contorno oscuro = predio analizado.")
+            st_folium(m, width=None, height=450, returned_objects=[], key="mapa_resultado_cota30")
         st.caption("GLO-30 es un modelo de superficie de 30 m (puede incluir vegetación y construcciones); usar como prediagnóstico, no como levantamiento topográfico.")
     except Exception as exc:
         result["error_dem"] = str(exc)
@@ -715,6 +841,7 @@ report = {
     "estado_ird": "NO OFICIAL — escenario exploratorio" if resultado_indice else "NO CALCULADO",
     "advertencia": "Escalas de amenaza MDSF 2025; vulnerabilidad del modelo tsunami; integración de pesos no validada como MDSF.",
     "geometria_epsg4326": mapping(polygon), "caracterizacion_terreno": result,
+    "amenazas_intersectadas": {"CITSU_SHOA": citsu_hits, "volcanica_SERNAGEOMIN": volcano_hits, "inundacion_DGA_MOP": flood_hits, "susceptibilidad_SERNAGEOMIN": sngm_hazard_hits, "eventos_historicos_SERNAGEOMIN": sngm_event_hits},
     "escalas_amenaza": selecciones, "factores_amenaza": factores, "variables_automaticas": {k: result.get(k) for k in ("fuente_dem", "suelo_ciren", "cobertura_copernicus", "escorrentia_automatica", "hidrografia_osm", "localizacion_proxy", "taludes_proxy", "intervencion_distancia_m")},
     "vulnerabilidad": {"materialidad": material, "normativa": norma, "puntaje": vuln},
     "pesos_modelo": {"condicionantes_generacion": p_gen, "area_alcance": 1-p_gen,

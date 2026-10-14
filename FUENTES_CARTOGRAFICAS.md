@@ -38,3 +38,22 @@ El mapa es de cribado. No reemplaza el PRC oficial, los estudios fundados de rie
 | Abanicos / taludes | Sin capa nacional adecuada para inferirlos automáticamente en esta versión | Mantener el factor sin puntaje cuando no hay evidencia; no inferir “fuera de abanico”.
 
 Copernicus GLO-30: <https://registry.opendata.aws/copernicus-dem/>  · CGLS 2019: <https://land.copernicus.eu/en/products/global-dynamic-land-cover/copernicus-global-land-service-land-cover-100m-collection-3-epoch-2015-2019-globe> · CIREN Suelos Agrológicos: <https://esri.ciren.cl/server/rest/services/IDEMINAGRI/SUELOS_AGROLOGICOS/MapServer> · OSM Overpass: <https://overpass-api.de/>.
+
+## Amenazas nuevas del visor (implementación 14-10-2026)
+
+| Amenaza | Capa integrada | Alcance y advertencia |
+|---|---|---|
+| Tsunami | SHOA CITSU Coquimbo–La Serena, KMZ 2.ª edición (2015) | Se superpone al mapa y cruza con el predio. Corroborar edición actual en SHOA; el catálogo SHOA publica cartas por localidad, no una sola cobertura vectorial nacional.
+| Cota 30 | Cálculo GLO-30 de píxeles ≤30 m dentro del predio dibujado | Indicador topográfico automático dentro del área analizada; no equivale a CITSU, zona de inundación ni línea oficial de seguridad.
+| Volcán | Servicio ArcGIS nacional `Riesgo_Volcánico/FeatureServer/6` | Capa referencial para cobertura de amenaza; validar contra cartas de peligros SERNAGEOMIN por volcán, con fechas y escalas diferentes.
+| Inundación fluvial | DGA, Mapa de Amenaza de Inundación del río Mataquito (2025), KMZ; DOH/SIALL puntos referenciales de inundación | La capa DGA cubre Mataquito; los puntos DOH/SIALL publicados no son una cobertura nacional. Los PRC cargados pueden aportar zonificación local adicional.
+
+## Suelo de fundación: fuentes consultadas
+
+No se identificó una base nacional homogénea y abierta de clases geotécnicas de fundación mantenida por MINVU. MINVU/DITEC publica manuales técnicos sobre suelos orgánicos, licuables, expansivos, caracterización y construcción en suelos salinos, entre otros; son lineamientos, no un mapa parcelario. CIREN mantiene estudios agrológicos y capacidad de uso del suelo, que no miden directamente Vs30, N-SPT, resistencia o parámetros de diseño de fundaciones. SERNAGEOMIN tiene estudios locales de suelo de fundación y microzonificación (por ejemplo Valdivia, Concepción, Iquique y Alto Hospicio), publicados individualmente en su catálogo.
+
+En el visor, el dato CIREN se conserva como categoría agrícola. El cruce a puntaje MDSF es una analogía de prototipo, no clase geotécnica. La conversión debe ser calibrada o reemplazada por estudio de mecánica de suelos antes de usarla en seguros, diseño o decisiones oficiales.
+
+Referencias para suelos: [MINVU DITEC, manuales técnicos](https://www.minvu.gob.cl/ditec/manuales-tecnicos-ditec/) · [CIREN Suelo](https://www.ciren.cl/suelo) · [Catálogo de publicaciones SERNAGEOMIN](https://portalsdnmext.sernageomin.cl/publicacionesgeologicas) · [Decreto Supremo 61, diseño sísmico de edificios](https://www.bcn.cl/leychile/navegar?idNorma=1034101).
+
+Referencias nuevas: [CITSU SHOA](https://www.shoa.cl/php/citsu.php) · [CITSU Coquimbo–La Serena (metadatos y KMZ)](https://geoportal.cl/geoportal/catalog/35928/Capa%20Vectorial%20-%20Carta%20Inundaci%C3%B3n%20por%20Tsunami%20Coquimbo%20-%20La%20Serena) · [DGA mapas de amenaza de inundación](https://dga.mop.gob.cl/mapas-de-amenaza-de-inundacion/) · [DOH/SIALL](https://rest-sit.mop.gob.cl/arcgis/rest/services/DOH/SIALL/MapServer) · [SERNAGEOMIN, Peligros volcánicos](https://portalgeomin.sernageomin.cl/service/60de3ded818938000000).
