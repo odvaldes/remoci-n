@@ -1,48 +1,31 @@
-# GeoRiskAI Sentinel — prototipo Streamlit
+# GeoRiskAI Sentinel — Remoción en masa por flujos
 
-## Qué hace esta primera versión
+Prototipo para dibujar o importar polígonos, caracterizar superficie y analizar pendientes mediante un DEM GeoTIFF. El mapa puede superponer áreas de riesgo del PRC de La Serena, una capa vectorial regional para Coquimbo y capas de SERNAGEOMIN de susceptibilidad/eventos.
 
-- Recibe dirección, comuna, m² construidos y m² no construidos.
-- Permite subir hasta cinco fotografías.
-- Si está configurada una clave de OpenAI, solicita una estimación visual preliminar de nivel de daño/limpieza, superficie visible afectada, volumen de escombros y horas-hombre.
-- Calcula un rango de presupuesto solo cuando se ingresan tarifas reales en el panel lateral.
-- Incluye una solicitud separada para buscar orientación sobre una póliza vigente o cobertura para eventos futuros.
-- Busca coincidencias solo en `insurance_partners.csv`; el archivo parte vacío para evitar mostrar empresas o pólizas no verificadas.
-- Recibe consentimiento por separado para análisis de fotos, compartir datos con empresas y conservar fotos para mejorar el modelo.
-- Guarda las solicitudes en Supabase si está configurado; localmente usa SQLite solo para pruebas.
+## Capas territoriales integradas
+- **La Serena:** KMZ municipal de zonas de riesgo y fajas no edificables del PRC 2020 (el municipio lo califica como referencial).
+- **Coquimbo:** consulta a la capa `IPT_04_PRC_Coquimbo_R` del servicio de información territorial. El PRC actualizado está vigente desde el 5 de enero de 2026; como la capa vectorial no identifica claramente en sus metadatos la versión del instrumento, verificarla contra los planos y ordenanza vigentes antes de usarla normativamente.
+- **SERNAGEOMIN:** consulta de las capas publicadas en el mapa de susceptibilidad de flujos de detritos de Coquimbo, más el catastro de eventos históricos (1962–2021). El catastro representa eventos registrados, no una zonificación de peligro actual.
+- La interfaz deja a mano los informes/cartas SERNAGEOMIN Coquimbo Norte (IR-18-68) y Coquimbo Sur (IR-21-88), ambos de referencia regional a escala 1:250.000.
+- El cruce solo calcula intersección geométrica con las capas que respondan. No reemplaza estudios fundados, revisión DOM, geotecnia ni una determinación oficial de peligro o riesgo.
 
-El prototipo no contiene tarifas de empresas verificadas ni una base de proveedores. La asignación a empresas queda pendiente de revisión manual. Las estimaciones fotográficas son experimentales y deben contrastarse con mediciones y trabajos reales antes de usarlas como cotización definitiva. El módulo de daño entrega un nivel y superficie visual afectada; todavía no calcula pérdida económica en pesos ni determina cobertura de una póliza.
-
-## Ejecutar en el computador
-
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-streamlit run app.py
-```
-
-En Windows, activa el entorno con `.venv\\Scripts\\activate`.
-
-Para probar solo la interfaz no necesitas OpenAI ni Supabase. Sin OpenAI, no se calcula el resultado visual. Sin Supabase, la base SQLite local sirve para pruebas, pero no es persistente al desplegar en Streamlit Community Cloud.
-
-## Activar análisis de fotografías
-
-Configura `OPENAI_API_KEY` en `.streamlit/secrets.toml` local o en Secrets de Streamlit Cloud. Las llamadas a la API pueden generar cobros según la cuenta y el uso. La app solicita consentimiento antes de enviar las fotos.
-
-## Guardar solicitudes en Supabase
-
-1. Crea un proyecto Supabase.
-2. Ejecuta `schema_supabase.sql` en el SQL Editor.
-3. Copia `SUPABASE_URL` y `SUPABASE_ANON_KEY` desde el proyecto a Secrets.
-4. No publiques `secrets.toml` ni claves privadas en el repositorio.
-
-La tabla tiene inserción anónima para este piloto y no permite leer las solicitudes desde la app. Administra y revisa los registros desde Supabase. Antes de abrir el piloto al público, agrega controles contra spam, autenticación administrativa y una política de privacidad adecuada.
-
-## Cargar intermediarios y pólizas para el match
-
-Completa `insurance_partners.csv` solo después de revisar los antecedentes del corredor, liquidador o aseguradora y las condiciones de la póliza. `communes` y `risks` aceptan varios valores separados por `|`; usa `*` en `communes` para cobertura nacional. Marca `verified=true` y `active=true` solo tras revisar la vigencia en la CMF. El match filtra por comuna, amenaza y tipo de solicitud. No es una validación automática de cobertura.
+Las capas se consultan en línea y se almacenan en caché por 24 horas en la sesión de la aplicación. Streamlit debe poder acceder a `mapas.laserena.cl`, `services6.arcgis.com`, `services3.arcgis.com` y `www.arcgis.com`. Si una fuente no está disponible, la app lo muestra y sigue con las capas restantes.
 
 ## Despliegue en Streamlit Community Cloud
+1. Sube `app.py` y `requirements.txt` a la raíz de un repositorio GitHub.
+2. En https://share.streamlit.io selecciona **Create app** y el repositorio.
+3. Main file path: `app.py`.
+4. Abre el mapa y dibuja un polígono o sube un GeoJSON (EPSG:4326).
+5. Para calcular pendientes, sube un DEM GeoTIFF que cubra el polígono. También se admite `DEM_PATH` como variable de entorno o Streamlit Secret si el archivo existe en el servidor.
 
-Sube `app.py`, `requirements.txt` y `schema_supabase.sql` a un repositorio GitHub. En Streamlit Community Cloud selecciona ese repositorio y como archivo principal `app.py`. Después configura las claves en la sección Secrets de la app.
+## Limitaciones deliberadas
+- **No calcula el IRD oficial MDSF**. Faltan capas validadas, variables de vulnerabilidad y resiliencia y la integración verificada de escalas y ecuación oficial.
+- La integración de capas no cambia las escalas ni los cálculos del modelo; los polígonos se muestran como fuentes cartográficas independientes.
+- Confirmar con cada organismo las condiciones de reproducción, redistribución y uso comercial de los mapas/capas antes de ofrecer el producto por suscripción. El manual MDSF de remoción en masa usado por el prototipo indica licencia BY-NC-ND; el código y el servicio comercial requieren revisar derechos y obtener autorización si corresponde.
+- No descarga imágenes satelitales ni DEM automáticamente. El mapa base es de visualización, no una fuente de datos de pendiente.
+- Pendientes calculadas en grados; resultados sensibles a resolución, calidad y bordes del DEM. Se requiere comprobar la unidad/celda de análisis del manual.
+- La lectura del DEM cargado se realiza en memoria; para producción nacional usar COG por ventanas, almacenamiento remoto y límites de área.
+- Para proyectos en Chile insular o zonas fuera del continente, revisar el aviso de ubicación; el mapa no está restringido a Chile continental.
+
+## Desarrollo posterior
+Validar la versión de Coquimbo contra sus planos PRC 2026; verificar disponibilidad, escala, fecha y licencia de la capa SERNAGEOMIN; incorporar los mapas SERNAGEOMIN Norte y Sur como capas vectoriales o ráster georreferenciadas con permiso de uso; integrar COG nacional, cobertura Sentinel-2, cauces y abanicos validados; y contrastar el motor con el software MDSF.
