@@ -16,7 +16,7 @@ streamlit run app.py
 2. Crear `.streamlit/secrets.toml` a partir de `.streamlit_secrets.example.toml`.
 3. Ejecutar la app y consultar un intervalo temporal.
 
-El prototipo muestra el polígono de todos los relaves del servicio areal de SERNAGEOMIN; al seleccionar un sitio carga manzanas urbanas y entidades rurales censales del INE 2024 en el radio escogido. El mapa usa colores y borde discontinuo para distinguirlas. El prototipo consulta hasta ocho ventanas históricas distribuidas en el periodo seleccionado y permite descargar VV/VH como GeoTIFF. Las bandas no se convierten en nivel de inundación ni probabilidad de falla. Para operacionalizar debe añadirse calibración radiométrica/geométrica, máscara de agua validada, mosaicos consistentes, DEM y validación en terreno.
+El prototipo muestra el polígono de todos los relaves del servicio areal de SERNAGEOMIN; al seleccionar un sitio carga manzanas urbanas y entidades rurales censales del INE 2024 en el radio escogido. El mapa abre con imagen satelital Esri y permite alternar a calles desde el selector de capas. Las unidades censales se distinguen por color y borde discontinuo. El prototipo consulta hasta ocho ventanas históricas distribuidas en el periodo seleccionado y permite descargar VV/VH como GeoTIFF. Las bandas no se convierten en nivel de inundación ni probabilidad de falla. Para operacionalizar debe añadirse calibración radiométrica/geométrica, máscara de agua validada, mosaicos consistentes, DEM y validación en terreno.
 
 ## Límites que deben mantenerse visibles
 

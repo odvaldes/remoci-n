@@ -221,7 +221,13 @@ with left:
         nearby, nearby_errors = [], []
         map_center = [-35.6, -71.4]
         map_zoom = 4
-    fmap = folium.Map(location=map_center, zoom_start=map_zoom, control_scale=True, tiles="CartoDB positron")
+    fmap = folium.Map(location=map_center, zoom_start=map_zoom, control_scale=True, tiles=None)
+    folium.TileLayer(
+        tiles="https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}",
+        attr="Tiles © Esri — Source: Esri, Maxar, Earthstar Geographics, and the GIS User Community",
+        name="Imagen satelital Esri", overlay=False, control=True, show=True, max_zoom=19,
+    ).add_to(fmap)
+    folium.TileLayer("OpenStreetMap", name="Mapa de calles", overlay=False, control=True, show=False).add_to(fmap)
     if sites:
         enriched = []
         for site in sites:
@@ -254,7 +260,7 @@ with left:
     folium.LayerControl(collapsed=False).add_to(fmap)
     st_folium(fmap, height=570, use_container_width=True, returned_objects=[])
     if sites:
-        st.caption("Morado: todos los polígonos nacionales del catastro. Rojo: depósito seleccionado. Turquesa: manzanas urbanas INE 2024. Naranjo: entidades rurales INE 2024. El tramado del borde diferencia las áreas censales.")
+        st.caption("El mapa abre en imagen satelital Esri; en el control de capas puedes cambiar a calles. Morado: relaves nacionales. Rojo: depósito seleccionado. Turquesa: manzanas urbanas INE 2024. Naranjo: entidades rurales INE 2024. El borde discontinuo diferencia áreas censales.")
     if nearby_errors:
         st.warning("Algunas capas censales no se pudieron cargar: " + " · ".join(nearby_errors))
     if map_mode == "Entorno del depósito" and show_communities:
