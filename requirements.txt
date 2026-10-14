@@ -7,3 +7,6 @@ scikit-learn>=1.4
 numpy>=1.26
 folium>=0.17
 streamlit-folium>=0.20
+networkx>=3.2
+shapely>=2.0
+pyproj>=3.6

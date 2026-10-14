@@ -13,6 +13,10 @@ import requests
 import streamlit as st
 import folium
 from streamlit_folium import st_folium
+import networkx as nx
+from pyproj import Transformer
+from shapely.geometry import shape, Point, LineString, MultiLineString, GeometryCollection
+from shapely.ops import transform as shapely_transform, unary_union
 
 st.set_page_config(page_title="GeoRiskAI · Relaves", page_icon="⛏️", layout="wide")
 
@@ -23,6 +27,9 @@ CDSE_PROCESS_URL = "https://sh.dataspace.copernicus.eu/process/v1"
 SERNAGEOMIN_LAYER = "https://services1.arcgis.com/OyjvVdFTl5hfSdX3/ArcGIS/rest/services/CDR_CHILE_AREAL_2025/FeatureServer/0"
 INE_URBAN_LAYER = "https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/MANZANAS_2024/FeatureServer/0"
 INE_RURAL_LAYER = "https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/ENTIDADES_2024/FeatureServer/0"
+INE_CENSUS_ZONES_LAYER = "https://services.arcgis.com/r7t1P5pnkoOLRdhr/arcgis/rest/services/Microdatos_Censo_2024/FeatureServer/3"
+DGA_CAUCES_LAYER = "https://rest-sit.mop.gob.cl/arcgis/rest/services/SNIA/SNIA_CAUCES/MapServer/0"
+BNA_BASINS_LAYER = "https://services.arcgis.com/r7t1P5pnkoOLRdhr/ArcGIS/rest/services/Cuencas/FeatureServer/0"
 
 
 @st.cache_data(ttl=21600, show_spinner=False)
@@ -142,7 +149,10 @@ def load_ine_nearby(lat: float, lon: float, radius_km: int) -> tuple[list[dict],
                 for feat in batch:
                     attrs = feat.get("properties") or {}
                     fid = next((attrs[k] for k in attrs if k.casefold() in ("objectid", "fid", "id")), "")
-                    feat["properties"] = {"capa": layer_name, "id": str(fid)}
+                    comuna = next((attrs[k] for k in attrs if k.casefold() in ("comuna", "nom_comuna") and attrs[k]), "")
+                    rural_code = next((attrs[k] for k in attrs if k.casefold() == "manzent" and attrs[k]), "")
+                    code = rural_code or fid
+                    feat["properties"] = {"capa": layer_name, "id": str(code), "comuna": str(comuna)}
                     result.append({"type": "Feature", "geometry": feat.get("geometry"), "properties": feat["properties"], "color": color})
                 features.extend(batch)
                 if not page.get("exceededTransferLimit") and len(batch) < 2000:
@@ -155,6 +165,194 @@ def load_ine_nearby(lat: float, lon: float, radius_km: int) -> tuple[list[dict],
         except Exception as e:
             errors.append(f"{layer_name}: {str(e)[:160]}")
     return result, errors
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_ine_urban_zones(lat: float, lon: float, radius_km: int) -> tuple[list[dict], str | None]:
+    """Carga zonas censales INE 2024 cercanas como referencia de tejido urbano."""
+    dlat = radius_km / 111.0
+    dlon = radius_km / (111.0 * max(.2, math.cos(math.radians(lat))))
+    envelope = f"{lon-dlon},{lat-dlat},{lon+dlon},{lat+dlat}"
+    result = []
+    offset = 0
+    try:
+        while offset < 6000:
+            params = {
+                "where": "1=1", "outFields": "NOM_REGION,NOM_PROVINCIA,NOM_COMUNA,NOM_DISTRITO,COD_ZONA,NOM_LOCALIDAD,AREA_C",
+                "returnGeometry": "true", "outSR": "4326", "geometry": envelope,
+                "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+                "spatialRel": "esriSpatialRelIntersects", "geometryPrecision": 5,
+                "f": "geojson", "resultOffset": offset, "resultRecordCount": 1000,
+            }
+            response = requests.get(f"{INE_CENSUS_ZONES_LAYER}/query", params=params, timeout=75)
+            response.raise_for_status()
+            page = response.json()
+            if "error" in page:
+                raise RuntimeError(page["error"].get("message", "Error de consulta de zonas INE"))
+            batch = page.get("features", [])
+            for feat in batch:
+                p = feat.get("properties") or {}
+                feat["properties"] = {
+                    "capa": "Zonas censales INE 2024",
+                    "comuna": str(p.get("NOM_COMUNA") or ""),
+                    "zona": str(p.get("COD_ZONA") or ""),
+                    "distrito": str(p.get("NOM_DISTRITO") or ""),
+                    "localidad": str(p.get("NOM_LOCALIDAD") or ""),
+                    "estrato": str(p.get("AREA_C") or ""),
+                }
+                result.append({"type": "Feature", "geometry": feat.get("geometry"), "properties": feat["properties"], "color": "#7b61a8"})
+            if not page.get("exceededTransferLimit") and len(batch) < 1000:
+                break
+            if not batch:
+                break
+            offset += len(batch)
+        if offset >= 6000:
+            return result, "Consulta de zonas censales limitada a 6.000 polígonos."
+        return result, None
+    except Exception as e:
+        return [], str(e)[:180]
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def load_cauces_nearby(lat: float, lon: float, radius_km: int) -> tuple[list[dict], str | None]:
+    """Consulta cauces DGA (incluye ríos, esteros y quebradas) en una ventana local."""
+    dlat = radius_km / 111.0
+    dlon = radius_km / (111.0 * max(.2, math.cos(math.radians(lat))))
+    envelope = f"{lon-dlon},{lat-dlat},{lon+dlon},{lat+dlat}"
+    all_features = []
+    offset = 0
+    try:
+        while offset < 6000:
+            params = {"where": "1=1", "outFields": "*", "returnGeometry": "true", "outSR": "4326",
+                      "geometry": envelope, "geometryType": "esriGeometryEnvelope", "inSR": "4326",
+                      "spatialRel": "esriSpatialRelIntersects", "geometryPrecision": 5,
+                      "f": "geojson", "resultOffset": offset, "resultRecordCount": 1000}
+            response = requests.get(f"{DGA_CAUCES_LAYER}/query", params=params, timeout=75)
+            response.raise_for_status()
+            page = response.json()
+            if "error" in page:
+                raise RuntimeError(page["error"].get("message", "Error al consultar cauces DGA"))
+            batch = page.get("features", [])
+            if not batch and offset == 0:
+                # Compatibilidad con servicios ArcGIS que responden geometrías Esri JSON.
+                params["f"] = "json"
+                response = requests.get(f"{DGA_CAUCES_LAYER}/query", params=params, timeout=75)
+                response.raise_for_status()
+                raw = response.json()
+                if "error" in raw:
+                    raise RuntimeError(raw["error"].get("message", "Error al consultar cauces DGA"))
+                for item in raw.get("features", []):
+                    geom = item.get("geometry") or {}
+                    if "paths" in geom:
+                        coords = geom["paths"]
+                        geo = {"type": "LineString", "coordinates": coords[0]} if len(coords) == 1 else {"type": "MultiLineString", "coordinates": coords}
+                    else:
+                        continue
+                    batch.append({"type": "Feature", "geometry": geo, "properties": item.get("attributes", {})})
+            all_features.extend(batch)
+            if not page.get("exceededTransferLimit") and len(batch) < 1000:
+                break
+            if not batch:
+                break
+            offset += len(batch)
+        normalized = []
+        for i, feature in enumerate(all_features):
+            props = feature.get("properties") or {}
+            kind = next((props[k] for k in props if "tipo" in k.casefold() and props[k]), "")
+            name = next((props[k] for k in props if "nombre" in k.casefold() and props[k]), "")
+            normalized.append({"type": "Feature", "geometry": feature.get("geometry"),
+                               "properties": {"tipo": str(kind) or "Cauce sin tipo", "nombre": str(name) or f"Cauce {i+1}"}})
+        return normalized, None
+    except Exception as e:
+        return [], str(e)[:200]
+
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def load_dga_basin(lat: float, lon: float) -> tuple[dict | None, str | None]:
+    """Ubica el punto en la cuenca BNA y devuelve nombre, código y área."""
+    params = {
+        "where": "1=1", "outFields": "COD_CUEN,NOM_CUEN,Area_km2",
+        "returnGeometry": "true", "outSR": "4326", "f": "geojson",
+        "geometry": f"{lon},{lat}", "geometryType": "esriGeometryPoint",
+        "inSR": "4326", "spatialRel": "esriSpatialRelIntersects", "resultRecordCount": 5,
+    }
+    try:
+        response = requests.get(f"{BNA_BASINS_LAYER}/query", params=params, timeout=45)
+        response.raise_for_status()
+        data = response.json()
+        if "error" in data:
+            raise RuntimeError(data["error"].get("message", "Error de consulta BNA"))
+        features = data.get("features", [])
+        if not features:
+            return None, "El punto no cayó dentro de una cuenca de la capa BNA consultada."
+        # Si por solapes de borde devuelve más de un polígono, prioriza el de menor superficie.
+        features.sort(key=lambda f: float((f.get("properties") or {}).get("Area_km2") or 1e30))
+        feat = features[0]
+        p = feat.get("properties") or {}
+        feat["properties"] = {
+            "codigo_bna": str(p.get("COD_CUEN") or "Sin código"),
+            "nombre_bna": str(p.get("NOM_CUEN") or "Cuenca sin nombre"),
+            "area_km2": float(p["Area_km2"]) if p.get("Area_km2") is not None else None,
+        }
+        return feat, None
+    except Exception as e:
+        return None, str(e)[:180]
+
+
+@st.cache_data(ttl=21600, show_spinner=False)
+def assess_hydro_connection(tailings_feature: dict | None, populated_features: list[dict], cauces: list[dict], lat: float, lon: float) -> tuple[str, int]:
+    """Prueba continuidad topológica aproximada de la red; no calcula flujo ni inundación."""
+    if not tailings_feature or not tailings_feature.get("geometry") or not populated_features or not cauces:
+        return "Indeterminado: faltan polígonos de relave, áreas pobladas o cauces.", 0
+    zone = int((lon + 180) // 6) + 1
+    transformer = Transformer.from_crs("EPSG:4326", f"EPSG:{32700+zone}", always_xy=True)
+    project = lambda g: shapely_transform(transformer.transform, shape(g))
+    try:
+        tail = project(tailings_feature["geometry"])
+        settlements = [project(f["geometry"]) for f in populated_features if f.get("geometry")]
+        inhabited_zone = unary_union(settlements).buffer(120)
+        tail_zone = tail.buffer(120)
+        graph = nx.Graph()
+        node_xy: dict[tuple[int, int], tuple[float, float]] = {}
+        hydro_geoms = []
+        snap_m = 30.0
+        def node_for(x, y):
+            key = (round(x / snap_m), round(y / snap_m))
+            node_xy.setdefault(key, (key[0] * snap_m, key[1] * snap_m))
+            return key
+        for feature in cauces:
+            geom = feature.get("geometry")
+            if not geom:
+                continue
+            line = project(geom)
+            hydro_geoms.append(line)
+            lines = list(line.geoms) if isinstance(line, (MultiLineString, GeometryCollection)) else [line]
+            for part in lines:
+                if not isinstance(part, LineString):
+                    continue
+                coords = list(part.coords)
+                for a, b in zip(coords, coords[1:]):
+                    u, v = node_for(a[0], a[1]), node_for(b[0], b[1])
+                    if u != v:
+                        graph.add_edge(u, v)
+        if graph.number_of_edges() == 0:
+            return "Sin conexión detectable en la cartografía consultada.", len(hydro_geoms)
+        sources = {n for n, (x, y) in node_xy.items() if tail_zone.intersects(Point(x, y))}
+        targets = {n for n, (x, y) in node_xy.items() if inhabited_zone.intersects(Point(x, y))}
+        if not sources or not targets:
+            return "No se detectó conexión en esta ventana; puede faltar cartografía de quebradas menores.", len(hydro_geoms)
+        visited = set(sources)
+        frontier = list(sources)
+        while frontier:
+            node = frontier.pop()
+            if node in targets:
+                return "Posible continuidad de red entre el relave y polígonos censales; falta validar dirección de flujo y terreno.", len(hydro_geoms)
+            for nxt in graph.neighbors(node):
+                if nxt not in visited:
+                    visited.add(nxt); frontier.append(nxt)
+        return "No se detectó continuidad topológica en la ventana consultada; no descarta una ruta no cartografiada.", len(hydro_geoms)
+    except Exception as e:
+        return f"Indeterminado: no se pudo probar continuidad ({str(e)[:100]}).", len(cauces)
 
 st.markdown("""
 <style>
@@ -215,10 +413,19 @@ with left:
     st.markdown("#### Área del relave y entorno censal")
     if map_mode == "Entorno del depósito":
         nearby, nearby_errors = load_ine_nearby(lat, lon, radius_km) if show_communities else ([], [])
+        urban_zones, urban_zone_error = load_ine_urban_zones(lat, lon, radius_km)
+        cauces, hydro_error = load_cauces_nearby(lat, lon, radius_km)
+        basin_feature, basin_error = load_dga_basin(lat, lon)
+        hydro_status, hydro_count = assess_hydro_connection(
+            selected_site["feature"] if selected_site else None, nearby, cauces, lat, lon
+        )
         map_center = [lat, lon]
         map_zoom = 12
     else:
         nearby, nearby_errors = [], []
+        urban_zones, urban_zone_error = [], None
+        basin_feature, basin_error = None, None
+        cauces, hydro_error, hydro_status, hydro_count = [], None, "Selecciona el entorno de un depósito para revisar continuidad hidrográfica.", 0
         map_center = [-35.6, -71.4]
         map_zoom = 4
     fmap = folium.Map(location=map_center, zoom_start=map_zoom, control_scale=True, tiles=None)
@@ -228,6 +435,26 @@ with left:
         name="Imagen satelital Esri", overlay=False, control=True, show=True, max_zoom=19,
     ).add_to(fmap)
     folium.TileLayer("OpenStreetMap", name="Mapa de calles", overlay=False, control=True, show=False).add_to(fmap)
+    folium.WmsTileLayer(
+        url="https://mapproxy.terrascope.be/mapproxy/service",
+        layers="esa-worldcover-map-10m-2021-v2_map",
+        name="Cobertura satelital ESA WorldCover 2021",
+        fmt="image/png", transparent=True, version="1.1.1", opacity=.62,
+        attr="© ESA WorldCover 2021 v200 / Contains modified Copernicus Sentinel data",
+        overlay=True, control=True, show=True,
+    ).add_to(fmap)
+    folium.Circle(
+        location=[lat, lon], radius=50000, color="#ffd166", weight=2,
+        fill=False, dash_array="8, 6", tooltip="Radio de análisis: 50 km desde el depósito",
+        name="Radio de búsqueda: 50 km",
+    ).add_to(fmap)
+    if basin_feature:
+        basin_fc = {"type": "FeatureCollection", "features": [basin_feature]}
+        folium.GeoJson(
+            basin_fc, name="Cuenca BNA · DGA",
+            style_function=lambda feature: {"color": "#22a06b", "weight": 2, "fillColor": "#50c878", "fillOpacity": .08, "dashArray": "7, 4"},
+            tooltip=folium.GeoJsonTooltip(fields=["codigo_bna", "nombre_bna", "area_km2"], aliases=["Código BNA", "Cuenca", "Área km²"]),
+        ).add_to(fmap)
     if sites:
         enriched = []
         for site in sites:
@@ -254,18 +481,59 @@ with left:
             return {"color": color, "weight": 1.5, "fillColor": color, "fillOpacity": .22, "dashArray": "5, 3"}
         folium.GeoJson(urban_fc, name="Áreas censales cercanas · INE 2024",
                        style_function=census_style,
-                       tooltip=folium.GeoJsonTooltip(fields=["capa"], aliases=["Capa censal"])).add_to(fmap)
+                    tooltip=folium.GeoJsonTooltip(fields=["capa", "comuna", "id"], aliases=["Capa censal", "Comuna", "Código censal/INE"])).add_to(fmap)
+    if urban_zones:
+        zones_fc = {"type": "FeatureCollection", "features": urban_zones}
+        folium.GeoJson(
+            zones_fc, name="Zonas censales INE 2024",
+            style_function=lambda feature: {"color": "#7652a8", "weight": 2, "fillColor": "#9a78c9", "fillOpacity": .12, "dashArray": "3, 3"},
+            tooltip=folium.GeoJsonTooltip(fields=["comuna", "distrito", "zona", "localidad", "estrato"], aliases=["Comuna", "Distrito", "Código de zona", "Localidad", "Estrato censal"]),
+        ).add_to(fmap)
+    if cauces:
+        hydro_fc = {"type": "FeatureCollection", "features": cauces}
+        def hydro_style(feature):
+            kind = feature["properties"].get("tipo", "").casefold()
+            is_gully = "quebrada" in kind or "zanj" in kind
+            return {"color": "#1263a3" if is_gully else "#26a5d5", "weight": 2.6 if is_gully else 1.6,
+                    "dashArray": "6, 4" if is_gully else None, "opacity": .9}
+        folium.GeoJson(hydro_fc, name="Cauces, esteros y quebradas · DGA/MOP",
+                       style_function=hydro_style,
+                       tooltip=folium.GeoJsonTooltip(fields=["tipo", "nombre"], aliases=["Tipo", "Nombre"])).add_to(fmap)
     folium.CircleMarker([lat, lon], radius=4, color="#222", fill=True, fill_opacity=1,
                         tooltip=site_name).add_to(fmap)
+    if map_mode == "Entorno del depósito":
+        dlat50 = 50 / 111.0
+        dlon50 = 50 / (111.0 * max(.2, math.cos(math.radians(lat))))
+        fmap.fit_bounds([[lat-dlat50, lon-dlon50], [lat+dlat50, lon+dlon50]])
     folium.LayerControl(collapsed=False).add_to(fmap)
     st_folium(fmap, height=570, use_container_width=True, returned_objects=[])
     if sites:
-        st.caption("El mapa abre en imagen satelital Esri; en el control de capas puedes cambiar a calles. Morado: relaves nacionales. Rojo: depósito seleccionado. Turquesa: manzanas urbanas INE 2024. Naranjo: entidades rurales INE 2024. El borde discontinuo diferencia áreas censales.")
+        st.caption("El mapa abre en imagen satelital Esri; puedes activar/desactivar coberturas en el control de capas. ESA WorldCover 2021 clasifica la cobertura del suelo a 10 m: la clase 50 (roja) corresponde a superficie construida. El círculo marca 50 km desde el punto del depósito. INE aporta las unidades censales; DGA/MOP, cauces y quebradas.")
     if nearby_errors:
         st.warning("Algunas capas censales no se pudieron cargar: " + " · ".join(nearby_errors))
+    if hydro_error:
+        st.warning("No se pudo cargar la red hidrográfica DGA/MOP: " + hydro_error)
+    if urban_zone_error:
+        st.warning("No se pudo cargar la capa de zonas censales INE: " + urban_zone_error)
+    if basin_error:
+        st.warning("No se pudo identificar la cuenca BNA: " + basin_error)
+    if basin_feature:
+        bp = basin_feature["properties"]
+        st.markdown("**Cuenca hidrográfica y balance hídrico de referencia**")
+        b1, b2 = st.columns(2)
+        b1.metric("Cuenca BNA", bp["nombre_bna"])
+        b2.metric("Superficie", f"{bp['area_km2']:,.0f} km²" if bp.get("area_km2") is not None else "Sin dato")
+        st.caption(f"Código BNA {bp['codigo_bna']}. El Balance Hídrico Nacional DGA caracteriza componentes y flujos para el período histórico 1985–2015; sirve como contexto de cuenca, no como caudal de crecida actual ni como dirección local de flujo.")
+        st.markdown("[Consultar Balance Hídrico DGA](https://dga.mop.gob.cl/mapoteca-digital/) · [Consultar estadísticas hidrométricas y caudales observados](https://dga.mop.gob.cl/estadisticas-estaciones-dga/) · [Balance hídrico y proyecciones (U. de Chile)](https://www.balancehidrico.uchile.cl/)")
     if map_mode == "Entorno del depósito" and show_communities:
-        st.caption(f"Unidades censales dibujadas en el radio consultado: {len(nearby):,}.")
+        rural_n = sum("rurales" in f.get("properties", {}).get("capa", "").casefold() for f in nearby)
+        urban_n = len(nearby) - rural_n
+        st.caption(f"En el radio consultado: {urban_n:,} manzanas urbanas y {rural_n:,} entidades rurales/aldeas censales; {hydro_count:,} elementos hidrográficos consultados.")
+        st.markdown("**Continuidad hidrográfica preliminar hacia zonas pobladas**")
+        st.info(hydro_status)
+        st.caption("El chequeo detecta continuidad topológica aproximada en cauces cartografiados cercanos al polígono del relave y a unidades censales. No determina sentido de escurrimiento, caudal, alcance de una eventual rotura ni confirma que exista agua permanente.")
     st.caption("Las manzanas y entidades delimitan unidades censales, no garantizan ocupación actual en cada parcela. La población debe interpretarse de forma agregada con datos INE.")
+    st.caption("La clasificación satelital WorldCover es de 2021 y puede omitir expansiones urbanas posteriores o clasificar erróneamente superficies desnudas/mineras. Sus píxeles construidos son una señal para revisión, no un catastro predial ni un conteo de viviendas.")
 with right:
     st.markdown("#### Índice de priorización (demo)")
     st.markdown('<div class="risknote"><b>No es una probabilidad de colapso.</b><br>Este prototipo no tiene todavía población validada, escenarios hidráulicos ni etiquetas históricas suficientes para emitir un nivel de riesgo real.</div>',unsafe_allow_html=True)
@@ -390,4 +658,4 @@ colC.markdown("**Independencia verificable**\n\nMetodología pública, auditorí
 st.caption("La plataforma ayuda a priorizar análisis y coordinación. Alarmas, evacuaciones, declaraciones de seguridad y mapas de inundación por falla deben quedar en manos de autoridades y especialistas competentes.")
 
 with st.expander("Fuentes y siguientes integraciones"):
-    st.markdown("- [SERNAGEOMIN: Catastro areal nacional de relaves](https://services1.arcgis.com/OyjvVdFTl5hfSdX3/ArcGIS/rest/services/CDR_CHILE_AREAL_2025/FeatureServer)\n- [INE: manzanas urbanas Censo 2024](https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/MANZANAS_2024/FeatureServer)\n- [INE: entidades rurales Censo 2024](https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/ENTIDADES_2024/FeatureServer)\n- [Copernicus Data Space: Sentinel Hub y autenticación OAuth](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Overview/Authentication.html)\n- [Copernicus: ejemplo Sentinel-1 GRD](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Process/Examples/S1GRD.html)\n- [Copernicus: catálogo STAC](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Catalog.html)\n- [Consejo Minero: ficha Las Tórtolas](https://consejominero.cl/operaciones/las-tortolas/)\n- [Municipalidad de Colina: ejercicio de emergencia con comunidades](https://www.colina.cl/colina-y-tiltil-reforzaron-protocolos-de-emergencia-ante-eventuales-eventos-en-relaves-las-tortolas/)")
+        st.markdown("- [SERNAGEOMIN: Catastro areal nacional de relaves](https://services1.arcgis.com/OyjvVdFTl5hfSdX3/ArcGIS/rest/services/CDR_CHILE_AREAL_2025/FeatureServer)\n- [INE: manzanas urbanas Censo 2024](https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/MANZANAS_2024/FeatureServer)\n- [INE: entidades rurales Censo 2024](https://services7.arcgis.com/5YrXOaoVCm5NKrty/arcgis/rest/services/ENTIDADES_2024/FeatureServer)\n- [INE: zonas censales Censo 2024](https://services.arcgis.com/r7t1P5pnkoOLRdhr/arcgis/rest/services/Microdatos_Censo_2024/FeatureServer/3)\n- [ESA WorldCover: acceso y leyenda de clases](https://esa-worldcover.org/en/data-access)\n- [Terrascope: servicios WMS/WMTS](https://docs.terrascope.be/Developers/WebServices/OGC/WMTSv2.html)\n- [DGA/MOP: red de cauces de Chile](https://rest-sit.mop.gob.cl/arcgis/rest/services/SNIA/SNIA_CAUCES/MapServer/0)\n- [DGA: Mapoteca digital (cuencas BNA y balance hídrico)](https://dga.mop.gob.cl/mapoteca-digital/)\n- [DGA: estadísticas de estaciones hidrométricas](https://dga.mop.gob.cl/estadisticas-estaciones-dga/)\n- [DGA/U. de Chile: actualización del balance hídrico nacional 1985–2015 y proyecciones 2030–2060](https://www.balancehidrico.uchile.cl/)\n- [Copernicus Data Space: DEM](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Data/DEM.html)\n- [Copernicus Data Space: Sentinel Hub y autenticación OAuth](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Overview/Authentication.html)\n- [Copernicus: ejemplo Sentinel-1 GRD](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Process/Examples/S1GRD.html)\n- [Copernicus: catálogo STAC](https://documentation.dataspace.copernicus.eu/APIs/SentinelHub/Catalog.html)\n- [Consejo Minero: ficha Las Tórtolas](https://consejominero.cl/operaciones/las-tortolas/)\n- [Municipalidad de Colina: ejercicio de emergencia con comunidades](https://www.colina.cl/colina-y-tiltil-reforzaron-protocolos-de-emergencia-ante-eventuales-eventos-en-relaves-las-tortolas/)")
