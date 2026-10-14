@@ -25,3 +25,16 @@ Revisión de fuentes: 14 de octubre de 2026. Las capas se consultan en línea en
 Las capas se muestran como referencias independientes y no modifican los cálculos del modelo. Antes de ofrecer el producto por suscripción, confirmar permisos de acceso, redistribución, almacenamiento en caché y uso comercial con cada titular. El manual MDSF 2025 de remoción en masa utilizado por el prototipo indica licencia Creative Commons BY-NC-ND; el uso comercial y cualquier adaptación de escalas deben revisarse y contar con autorización cuando corresponda.
 
 El mapa es de cribado. No reemplaza el PRC oficial, los estudios fundados de riesgo, la revisión de la DOM ni el análisis geológico/geotécnico en terreno.
+
+## Variables automáticas experimentales añadidas
+
+| Variable | Fuente/método | Límite de interpretación |
+|---|---|---|
+| Pendiente | Copernicus DEM GLO-30, COG remoto AWS; estadístico máximo y percentil 95 sobre el polígono | DSM global de 30 m; no reemplaza topografía de detalle.
+| Cobertura | Copernicus Global Land Cover 100 m, año 2019 (CGLS v3); clase mayoritaria | Resolución 100 m y fecha histórica; un predio pequeño puede no tener píxeles válidos.
+| Suelo de fundación | CIREN, capacidad de uso agrícola de Coquimbo 2022 (campo `textcaus`) con cruce experimental I–VIII a puntaje MDSF A–F | No es geotecnia ni clase sísmica. Cruce no validado y no usar para decisiones críticas.
+| Escorrentía | Tabla MDSF alimentada con pendiente p95, cobertura CGLS agregada y permeabilidad supuesta desde clase agrícola | La permeabilidad no se mide en la capa agrícola; puntaje experimental.
+| Cauce / intervención | Distancias a objetos de hidrografía/obras publicados en OpenStreetMap, consulta Overpass | Inventario voluntario incompleto; no hallar objeto no prueba ausencia.
+| Abanicos / taludes | Sin capa nacional adecuada para inferirlos automáticamente en esta versión | Mantener el factor sin puntaje cuando no hay evidencia; no inferir “fuera de abanico”.
+
+Copernicus GLO-30: <https://registry.opendata.aws/copernicus-dem/>  · CGLS 2019: <https://land.copernicus.eu/en/products/global-dynamic-land-cover/copernicus-global-land-service-land-cover-100m-collection-3-epoch-2015-2019-globe> · CIREN Suelos Agrológicos: <https://esri.ciren.cl/server/rest/services/IDEMINAGRI/SUELOS_AGROLOGICOS/MapServer> · OSM Overpass: <https://overpass-api.de/>.
